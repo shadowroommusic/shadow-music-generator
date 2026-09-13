@@ -6,6 +6,10 @@ Repo conventions and the current roadmap, for anyone (human or agent) picking th
 
 One MCP plugin = one repository.
 
+These MCPs are the **tool layer**: each one is useful on its own (any MCP-capable agent can drive
+it), and together they are the toolkit that `producer-tools` bundles into one app and
+`shadow-producers` drives as an agent.
+
 | Repo | What it is | Status |
 | --- | --- | --- |
 | `rekordbox-serato-bridge` | Rekordbox ⇄ Serato library conversion (cues, loops, colors, playlists) | published; real-machine tested |
@@ -31,15 +35,16 @@ One MCP plugin = one repository.
 - **Real-machine verification** (Rekordbox, Serato, the actual hardware) is required before calling a
   conversion feature done.
 
+## Decisions
+
+- **2026-09-14 — generator backend (option B).** `shadow-music-generator` stays backend-less for
+  now: it is used as a job record + request manager (prompts, lyrics, parameters, license notes,
+  dry-run by default). The real provider wiring happens later inside `producer-tools`. The YuE2
+  adapter in `src/shadow_music_generator/adapters/` is kept as ready groundwork for whenever a
+  machine or API is chosen — YuE2 itself needs Linux + an NVIDIA GPU (BF16, 24 GB), so it normally
+  runs remotely (local GPU box, ssh, or a cloud API).
+
 ## Roadmap
-
-### Where this plugin sits
-
-`shadow-music-generator` is a **lightweight job queue + backend adapter layer**: it never bundles a
-model and has no ML dependencies, so it can be embedded in the app. The heavy generation stays
-outside — a local GPU machine, a rented box over ssh, or a cloud API — and is reached through an
-adapter (`SHADOW_PIPELINE_FACTORY`). YuE2 itself needs Linux + an NVIDIA GPU (BF16, 24 GB), which is
-why it is normally run remotely.
 
 1. Publish each MCP as its own public repository. ✅ *(done)*
 2. **Test and optimise every MCP and the software gradually** — plugin by plugin, on the real

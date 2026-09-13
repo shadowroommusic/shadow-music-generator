@@ -23,6 +23,17 @@ runs wherever your adapter points it: a local GPU machine, a rented box over ssh
 - **License aware.** The model license is recorded in every job result, and no weights are
   downloaded or bundled.
 
+## Current scope
+
+This plugin is the **generation scheduling layer**: a lightweight job queue that records prompts, lyrics,
+parameters, stage timings, artifacts and license notes, and drives whatever backend you point it at.
+It ships no model and no ML dependency.
+
+Out of the box it is used in **dry-run / records-only mode** — submit jobs to keep a searchable
+history of prompts and settings. Wiring a real provider (local GPU, remote box, or a cloud API) is
+planned to happen inside the `producer-tools` app. The YuE2 adapter further down is already
+implemented and tested for whenever you want to point it at a machine that can generate.
+
 ## Requirements
 
 | | |
