@@ -1,7 +1,7 @@
 # Shadow Music Generator
 
-一个 MCP 服务器：为 Shadow Producers 排队并执行**音乐生成任务**（YuE 及兼容流程）—— 除非你明确要求，
-它不会下载任何权重、也不会启动模型。
+一个 MCP 服务器：为**任何支持 MCP 的 agent**（包括 Shadow Producers）排队并执行**音乐生成任务**
+（YuE 及兼容流程）—— 除非你明确要求，它不会下载任何权重、也不会启动模型。
 
 [English](README.md) · 许可证：[AGPL-3.0](LICENSE)
 
@@ -88,6 +88,29 @@ export SHADOW_PIPELINE_FACTORY=/path/to/my_yue_adapter.py:make_pipeline
 ```
 
 适配器契约（阶段、context、产物）见 [docs/internals.md](docs/internals.md)。
+
+### YuE / YuE2 适配器
+
+官方 [YuE](https://github.com/multimodal-art-projection/YuE) 流程接进来只需要一行：
+
+```sh
+export SHADOW_PIPELINE_FACTORY=shadow_music_generator.adapters.yue2_adapter:make_pipeline
+.venv/bin/shadow-music-generator submit --prompt 'dark melodic techno, 128 bpm' --mode local --run
+```
+
+两种跑法：
+
+- **在 YuE 环境里跑**（默认）：适配器 import `yue2`，直接调 YuE2 自己的分段 API
+  （`plan` → `generate_semantic` → `synthesize` → `decode`），所以每个阶段都会出现在任务报告里；
+- **在别处跑**（GPU 机器 / 容器 / 远程主机）：设置 `YUE_COMMAND` 命令模板，例如
+  `ssh gpu 'yue2 generate --request {request_json} --output {output_dir}'`。
+
+相关环境变量：`YUE_MODEL`（默认 `m-a-p/YuE2-3B`）、`YUE_DEVICE`、`YUE_VAE`、`YUE_COT`
+（`full`/`melody`/`off`）、`YUE_SEED`、`YUE_LYRICS`、`YUE_ABC`、`YUE_REQUEST_JSON`、`YUE_COMMAND`、
+`YUE_OUTPUTS`。
+
+队列**不对音频做任何后处理**：命令模式下 YuE 写出什么文件就是什么文件；管道模式下解码得到的采样
+按原样写成 48 kHz 音频。
 
 ## 模型许可证
 

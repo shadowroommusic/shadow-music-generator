@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,9 +20,63 @@ from shadow_music_generator.pipeline import (
     load_object,
     load_pipeline,
     resolve_spec,
+    run_stages,
 )
 
 SRC = Path(__file__).resolve().parents[1] / "src"
+
+FAKE_YUE2 = """
+class FakePlan:
+    def __init__(self, request):
+        self.request = request
+        self.saved = None
+
+    def save(self, path):
+        import os
+        os.makedirs(path, exist_ok=True)
+        self.saved = path
+
+
+class FakePipeline:
+    instances = []
+
+    def __init__(self):
+        self.calls = []
+        self.request = None
+
+    @classmethod
+    def from_pretrained(cls, model, device=None, vae=None):
+        instance = cls()
+        instance.model = model
+        instance.device = device
+        instance.vae = vae
+        cls.instances.append(instance)
+        return instance
+
+    def __enter__(self):
+        self.calls.append("enter")
+        return self
+
+    def __exit__(self, *exc):
+        self.calls.append("exit")
+
+    def plan(self, **request):
+        self.calls.append("plan")
+        self.request = request
+        return FakePlan(request)
+
+    def generate_semantic(self, plan):
+        self.calls.append("generate_semantic")
+        return {"tokens": [1, 2, 3]}
+
+    def synthesize(self, semantic):
+        self.calls.append("synthesize")
+        return {"latents": True}
+
+    def decode(self, latents):
+        self.calls.append("decode")
+        return [[0.25, -0.25]] * 16
+"""
 
 FAKE_PIPELINE = """
 import os
@@ -316,6 +372,100 @@ class InterfaceTests(PipelineTestCase):
         failure = json.loads(failed.stdout)
         self.assertEqual(failure["status"], "failed")
         self.assertIn("SHADOW_PIPELINE_FACTORY", failure["error"])
+
+
+class YuE2AdapterTests(unittest.TestCase):
+    """The YuE2 adapter maps our four stages 1:1 onto YuE2's staged API — and never touches audio."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.request = GenerationRequest(prompt="dark techno, 128 bpm", mode="local", output_dir=str(self.root / "out"))
+
+    def _fake_yue2(self):
+        module = types.ModuleType("yue2")
+        namespace: "dict[str, object]" = {}
+        exec(FAKE_YUE2, namespace)  # noqa: S102 - test fixture
+        module.YuE2Pipeline = namespace["FakePipeline"]
+        module.FakePipeline = namespace["FakePipeline"]
+        return module
+
+    def test_pipeline_mode_runs_yue2_stages_in_order(self) -> None:
+        from shadow_music_generator.adapters import yue2_adapter
+
+        fake = self._fake_yue2()
+        with mock.patch.dict(sys.modules, {"yue2": fake}):
+            pipeline = yue2_adapter.YuE2Adapter(model="fake/model", device="cpu")
+            stages, outputs = run_stages(pipeline, self.request, self.root / "out")
+
+        self.assertEqual([stage.name for stage in stages], ["plan", "generate_semantic", "synthesize", "decode"])
+        self.assertEqual([stage.status for stage in stages], ["completed"] * 4)
+        instance = fake.FakePipeline.instances[-1]
+        self.assertEqual(instance.model, "fake/model")
+        self.assertEqual(instance.device, "cpu")
+        self.assertEqual(instance.calls, ["enter", "plan", "generate_semantic", "synthesize", "decode", "exit"])
+        self.assertEqual(instance.request["style"], "dark techno, 128 bpm")
+        self.assertEqual(instance.request["cot"], "full")
+        self.assertTrue(outputs and Path(outputs[0]).exists())
+        self.assertEqual(Path(outputs[0]).name, "audio.wav")  # no soundfile in the test env → stdlib WAV fallback
+        self.assertTrue((self.root / "out" / "request.json").is_file())
+
+    def test_command_mode_collects_outputs_without_modifying_them(self) -> None:
+        from shadow_music_generator.adapters import yue2_adapter
+
+        script = self.root / "fake_yue.py"
+        script.write_text(
+            "import hashlib, pathlib, sys\n"
+            "out = pathlib.Path(sys.argv[1]); out.mkdir(parents=True, exist_ok=True)\n"
+            "target = out / 'song.flac'\n"
+            "payload = b'fLaC' + b'\\x00' * 64\n"
+            "target.write_bytes(payload)\n"
+            "(out / 'song.sha256').write_text(hashlib.sha256(payload).hexdigest())\n",
+            encoding="utf-8",
+        )
+        command = f"{sys.executable} {script} {{output_dir}}"
+        with mock.patch.dict(os.environ, {"YUE_COMMAND": command}):
+            pipeline = yue2_adapter.YuE2Adapter()
+            stages, outputs = run_stages(pipeline, self.request, self.root / "out2")
+
+        self.assertEqual([stage.status for stage in stages], ["completed"] * 4)
+        self.assertEqual(len(outputs), 1)
+        produced = Path(outputs[0])
+        recorded = (self.root / "out2" / "song.sha256").read_text()
+        self.assertEqual(hashlib.sha256(produced.read_bytes()).hexdigest(), recorded)
+
+    def test_command_mode_reports_missing_outputs(self) -> None:
+        from shadow_music_generator.adapters import yue2_adapter
+        from shadow_music_generator.pipeline import PipelineStageError
+
+        with mock.patch.dict(os.environ, {"YUE_COMMAND": f"{sys.executable} -c pass {{output_dir}}"}):
+            pipeline = yue2_adapter.YuE2Adapter()
+            with self.assertRaises(PipelineStageError) as caught:
+                run_stages(pipeline, self.request, self.root / "out3")
+        self.assertEqual(caught.exception.stage, "synthesize")
+        self.assertIn("no audio", str(caught.exception))
+
+    def test_command_mode_reports_failing_command(self) -> None:
+        from shadow_music_generator.adapters import yue2_adapter
+        from shadow_music_generator.pipeline import PipelineStageError
+
+        with mock.patch.dict(os.environ, {"YUE_COMMAND": f"{sys.executable} -c 'import sys; sys.exit(3)' {{output_dir}}"}):
+            pipeline = yue2_adapter.YuE2Adapter()
+            with self.assertRaises(PipelineStageError) as caught:
+                run_stages(pipeline, self.request, self.root / "out4")
+        self.assertEqual(caught.exception.stage, "generate_semantic")
+        self.assertIn("YUE_COMMAND failed", str(caught.exception))
+
+    def test_missing_yue2_environment_is_explained(self) -> None:
+        from shadow_music_generator.adapters import yue2_adapter
+        from shadow_music_generator.pipeline import PipelineStageError
+
+        with mock.patch.dict(sys.modules, {"yue2": None}), mock.patch.dict(os.environ, {"YUE_COMMAND": ""}):
+            pipeline = yue2_adapter.YuE2Adapter()
+            with self.assertRaises(PipelineStageError) as caught:
+                run_stages(pipeline, self.request, self.root / "out5")
+        self.assertIn("yue2", str(caught.exception))
 
 
 if __name__ == "__main__":

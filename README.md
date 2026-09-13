@@ -1,8 +1,8 @@
 # Shadow Music Generator
 
-An MCP server that queues and runs **music generation jobs** (YuE and compatible pipelines) for
-Shadow Producers — without downloading checkpoints or starting a model unless you explicitly ask
-for it.
+An MCP server that queues and runs **music generation jobs** (YuE and compatible pipelines) for any
+MCP-compatible agent — without downloading checkpoints or starting a model unless you explicitly
+ask for it.
 
 [中文说明](README.zh-CN.md) · License: [AGPL-3.0](LICENSE)
 
@@ -98,6 +98,29 @@ export SHADOW_PIPELINE_FACTORY=/path/to/my_yue_adapter.py:make_pipeline
 ```
 
 See [docs/internals.md](docs/internals.md) for the adapter contract (stages, context, outputs).
+
+### YuE / YuE2 adapter
+
+The official [YuE](https://github.com/multimodal-art-projection/YuE) pipeline plugs in with one line:
+
+```sh
+export SHADOW_PIPELINE_FACTORY=shadow_music_generator.adapters.yue2_adapter:make_pipeline
+.venv/bin/shadow-music-generator submit --prompt 'dark melodic techno, 128 bpm' --mode local --run
+```
+
+Two ways to run it:
+
+- **Inside a YuE environment** (default): the adapter imports `yue2` and calls YuE2's own staged API
+  (`plan` → `generate_semantic` → `synthesize` → `decode`), so every stage shows up in the job report.
+- **Anywhere else** (GPU box, container, remote host): set `YUE_COMMAND` to a command template, e.g.
+  `ssh gpu 'yue2 generate --request {request_json} --output {output_dir}'`.
+
+Relevant environment variables: `YUE_MODEL` (default `m-a-p/YuE2-3B`), `YUE_DEVICE`, `YUE_VAE`,
+`YUE_COT` (`full`/`melody`/`off`), `YUE_SEED`, `YUE_LYRICS`, `YUE_ABC`, `YUE_REQUEST_JSON`,
+`YUE_COMMAND`, `YUE_OUTPUTS`.
+
+The queue never post-processes audio: in command mode the files YuE writes are exactly the files you
+get, and in pipeline mode the decoded samples are written out as-is at 48 kHz.
 
 ## Model licensing
 

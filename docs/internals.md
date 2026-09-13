@@ -72,6 +72,34 @@ A missing stage, an unimportable module, an invalid spec or a stage exception is
 loading, GPU selection and licensing stay entirely inside the adapter — this plugin only sequences
 the calls.
 
+## YuE2 adapter (`shadow_music_generator.adapters.yue2_adapter`)
+
+YuE2's staged Python API is `plan() → generate_semantic() → synthesize() → decode()`, so the adapter
+maps one contract stage onto one YuE2 stage:
+
+| Contract stage | Pipeline mode (inside the YuE environment) | Command mode (`YUE_COMMAND`) |
+| --- | --- | --- |
+| `plan` | `YuE2Pipeline.from_pretrained(model, device, vae)` + `pipe.plan(**request)`, saved to `<output_dir>/plan` | writes `<output_dir>/request.json`, validates the template |
+| `generate_semantic` | `pipe.generate_semantic(plan)` | runs the command (placeholders substituted, no shell) |
+| `synthesize` | `pipe.synthesize(semantic)` | requires at least one audio file to exist |
+| `decode` | `pipe.decode(latents)` → `audio.flac` (48 kHz via `soundfile`, stdlib WAV fallback) | collects the produced audio files, untouched |
+
+Requests are built from the job (`prompt` → YuE `style`, `lyrics`) plus `YUE_REQUEST_JSON` as a base,
+then `YUE_COT`, `YUE_SEED`, `YUE_ABC`, `YUE_MODEL`. The adapter never decodes, re-encodes or
+normalises audio; a failure is reported per stage and keeps the earlier stages in the job record.
+
+### Proving the queue changes nothing
+
+1. Run a request directly in the YuE environment:
+   `yue2 generate --request request.json --output out-direct`
+2. Run the same request through the plugin:
+   `SHADOW_PIPELINE_FACTORY=shadow_music_generator.adapters.yue2_adapter:make_pipeline`
+   with the same seed (and, for a strict comparison, the same model/VAE revisions and device).
+3. Compare: `shasum -a 256 out-direct/audio.flac <job output>/audio.flac`.
+
+Identical hashes mean the queue added nothing to the audio; a difference points at the command
+(GPU, runtime version, sampling settings) rather than at this plugin.
+
 ## Tests
 
 The suite builds its own adapter modules in a temp directory, so it exercises the real import path,
