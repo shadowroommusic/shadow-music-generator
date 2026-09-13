@@ -1,0 +1,38 @@
+{
+  "name": "shadow-music-generator",
+  "version": "0.2.0+codex.20260913133410",
+  "description": "\u672c\u5730 AI \u97f3\u4e50\u751f\u6210\u4efb\u52a1\u961f\u5217\uff08ShadowRoom Music\uff09",
+  "author": {
+    "name": "ShadowRoom Music",
+    "email": "support@shadowroom.cn",
+    "url": "https://shadowroom.cn"
+  },
+  "homepage": "https://shadowroom.cn",
+  "repository": "https://github.com/shadowroommusic",
+  "license": "MIT",
+  "keywords": [
+    "music-generation",
+    "ai",
+    "dj",
+    "producer",
+    "mcp",
+    "shadowroom"
+  ],
+  "interface": {
+    "displayName": "Shadow Music Generator",
+    "shortDescription": "\u6392\u961f\u3001\u8fd0\u884c\u5e76\u8ffd\u8e2a\u672c\u5730 AI \u97f3\u4e50\u751f\u6210\u4efb\u52a1\u3002",
+    "longDescription": "\u9694\u79bb\u7684\u751f\u6210\u4efb\u52a1\u961f\u5217\uff1a\u9ed8\u8ba4 dry-run\uff0c\u4e0d\u4e0b\u8f7d\u6743\u91cd\u4e5f\u4e0d\u542f\u52a8\u6a21\u578b\uff1b\u53ea\u6709\u663e\u5f0f\u914d\u7f6e SHADOW_PIPELINE_FACTORY \u624d\u4f1a\u8dd1\u672c\u5730\u63a8\u7406\u3002\u6bcf\u4e2a\u4efb\u52a1\u8bb0\u5f55\u72b6\u6001\u3001\u56db\u4e2a\u6267\u884c\u9636\u6bb5\u3001\u4ea7\u51fa\u6587\u4ef6\u4e0e\u6a21\u578b\u8bb8\u53ef\u63d0\u793a\u3002",
+    "developerName": "ShadowRoom Music",
+    "category": "Music",
+    "capabilities": [
+      "music-generation",
+      "job-queue",
+      "local-inference"
+    ],
+    "websiteURL": "https://shadowroom.cn/tools",
+    "logo": "./assets/icon.png",
+    "brandColor": "#0B0B0F",
+    "defaultPrompt": "\u7528 Shadow Music Generator \u751f\u6210\u4e00\u6bb5 melodic techno\u3002"
+  },
+  "mcpServers": "./.mcp.json"
+}

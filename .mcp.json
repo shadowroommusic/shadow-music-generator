@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "shadow-music-generator": {
+      "command": "python3",
+      "args": [
+        "mcp_server.py"
+      ],
+      "cwd": "."
+    }
+  }
+}

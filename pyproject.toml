@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shadow-music-generator"
+version = "0.2.0"
+description = "Shadow Music Generator — 本地 AI 音乐生成任务队列（ShadowRoom Music）"
+readme = { file = "README.md", content-type = "text/markdown" }
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["music-generation", "ai", "job-queue", "mcp", "shadowroom"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://shadowroom.cn"
+Tools = "https://shadowroom.cn/tools"
+Repository = "https://github.com/shadowroommusic"
+
+[project.scripts]
+shadow-music-generator = "shadow_music_generator.cli:main"
+shadow-music-generator-mcp = "shadow_music_generator.mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
