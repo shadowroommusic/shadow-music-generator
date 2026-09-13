@@ -7,6 +7,9 @@ ask for it.
 面向任何支持 MCP 的 agent 的**音乐生成任务队列**（YuE 及兼容流程）：默认 dry-run，不下载权重、
 不启动模型，除非你明确要求。
 
+The plugin itself is lightweight by design — no models, no ML dependencies. The heavy generation
+runs wherever your adapter points it: a local GPU machine, a rented box over ssh, or a cloud API.
+
 [中文说明](README.zh-CN.md) · License: [AGPL-3.0](LICENSE)
 
 ## Features
