@@ -4,6 +4,9 @@ An MCP server that queues and runs **music generation jobs** (YuE and compatible
 MCP-compatible agent — without downloading checkpoints or starting a model unless you explicitly
 ask for it.
 
+面向任何支持 MCP 的 agent 的**音乐生成任务队列**（YuE 及兼容流程）：默认 dry-run，不下载权重、
+不启动模型，除非你明确要求。
+
 [中文说明](README.zh-CN.md) · License: [AGPL-3.0](LICENSE)
 
 ## Features
