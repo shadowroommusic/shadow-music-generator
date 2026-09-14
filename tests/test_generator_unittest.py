@@ -334,7 +334,14 @@ class InterfaceTests(PipelineTestCase):
         reply = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         self.assertEqual(
             [tool["name"] for tool in reply["result"]["tools"]],
-            ["submit_generation", "run_job", "job_status", "render_part", "render_song"],
+            [
+                "submit_generation",
+                "run_job",
+                "job_status",
+                "render_part",
+                "render_song",
+                "mix_arrangement",
+            ],
         )
 
     def test_cli_dry_run_and_failed_local_run(self) -> None:

@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["render_part", "render_song", "write_wav"]
+__all__ = ["mix_arrangement", "render_part", "render_song", "write_audio", "write_wav"]
 
 SAMPLE_RATE = 44_100
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -42,6 +42,89 @@ def write_wav(path: "str | Path", samples: np.ndarray, rate: int = SAMPLE_RATE) 
         handle.setframerate(rate)
         handle.writeframes(data.tobytes())
     return target
+
+
+def write_audio(
+    path: "str | Path",
+    samples: np.ndarray,
+    rate: int,
+    *,
+    bit_depth: int = 16,
+    container: str = "wav",
+) -> Path:
+    """Write mono audio as WAV (16/24-bit) or AIFF (16-bit).
+
+    Anything lossy (MP3/AAC) needs an encoder binary, which this project deliberately does not depend
+    on — the export UI says so instead of pretending.
+    """
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    clipped = np.clip(samples, -1.0, 1.0)
+    if container == "aiff":
+        frames = (clipped * 32767.0).astype(">i2").tobytes()
+        # 80-bit IEEE-754 extended sample rate, the one awkward part of the AIFF header
+        exponent = 16398
+        mantissa = int(rate) << 48
+        header = (
+            b"FORM"
+            + struct.pack(">I", 4 + 8 + 18 + 8 + len(frames))
+            + b"AIFF"
+            + b"COMM"
+            + struct.pack(">I", 18)
+            + struct.pack(">hIh", 1, len(frames) // 2, 16)
+            + struct.pack(">HQ", exponent, mantissa)
+            + b"SSND"
+            + struct.pack(">I", len(frames) + 8)
+            + struct.pack(">II", 0, 0)
+        )
+        target.write_bytes(header + frames)
+        return target
+    with wave.open(str(target), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(3 if bit_depth == 24 else 2)
+        handle.setframerate(rate)
+        if bit_depth == 24:
+            scaled = (clipped * 8388607.0).astype("<i4")
+            packed = scaled.astype("<i4").tobytes()
+            packed = b"".join(packed[i : i + 3] for i in range(0, len(packed), 4))
+            handle.writeframes(packed)
+        else:
+            handle.writeframes((clipped * 32767.0).astype("<i2").tobytes())
+    return target
+
+
+def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    """Linear resample — plenty for a mixdown, and no scipy dependency."""
+    if source_rate == target_rate or samples.size == 0:
+        return samples
+    count = int(round(samples.size * target_rate / source_rate))
+    if count <= 0:
+        return samples[:0]
+    source_index = np.linspace(0, samples.size - 1, count)
+    return np.interp(source_index, np.arange(samples.size), samples).astype(np.float32)
+
+
+def read_wav(path: "str | Path") -> "tuple[np.ndarray, int]":
+    """Read a PCM WAV as mono float samples."""
+    with wave.open(str(Path(path).expanduser()), "rb") as handle:
+        channels = handle.getnchannels()
+        width = handle.getsampwidth()
+        rate = handle.getframerate()
+        frames = handle.readframes(handle.getnframes())
+    if width == 3:
+        raw = np.frombuffer(frames, dtype=np.uint8).reshape(-1, 3)
+        values = (raw[:, 0].astype(np.int32) | (raw[:, 1].astype(np.int32) << 8) | (raw[:, 2].astype(np.int32) << 16))
+        values = np.where(values >= 1 << 23, values - (1 << 24), values)
+        data = values.astype(np.float32) / 8388608.0
+    elif width == 2:
+        data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    elif width == 1:
+        data = (np.frombuffer(frames, dtype="<u1").astype(np.float32) - 128.0) / 128.0
+    else:
+        data = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+    if channels > 1:
+        data = data.reshape(-1, channels).mean(axis=1)
+    return data, rate
 
 
 def _seconds_per_beat(bpm: float) -> float:
@@ -295,6 +378,77 @@ def _pad_to(signal: np.ndarray, size: int) -> np.ndarray:
     if signal.size >= size:
         return signal
     return np.pad(signal, (0, size - signal.size))
+
+
+def mix_arrangement(spec: dict) -> dict:
+    """Bounce an arrangement to one file.
+
+    `tracks` mirror the studio: each clip carries a file path and its position in bars, so the mix is
+    the arrangement the user sees — placed, gained, and rendered at the requested sample rate, bit
+    depth and container.
+    """
+    out_path = spec.get("out_path")
+    if not out_path:
+        raise ValueError("mix_arrangement needs an out_path")
+    bpm = float(spec.get("bpm", 120))
+    bars = float(spec.get("bars", 8))
+    sample_rate = int(spec.get("sample_rate", SAMPLE_RATE))
+    bit_depth = int(spec.get("bit_depth", 16))
+    container = str(spec.get("container", "wav")).lower()
+    if container not in ("wav", "aiff"):
+        raise ValueError("container must be wav or aiff (lossy formats need an encoder)")
+    seconds_per_bar = 60.0 / max(1.0, bpm) * 4
+    total = int(round(bars * seconds_per_bar * sample_rate))
+    mix = np.zeros(max(1, total), dtype=np.float32)
+    used: "list[dict]" = []
+
+    for track in spec.get("tracks") or []:
+        track_gain = float(track.get("gain", 1.0))
+        if track_gain <= 0:
+            continue
+        for clip in track.get("clips") or []:
+            path = clip.get("path")
+            if not path:
+                continue
+            try:
+                samples, rate = read_wav(path)
+            except Exception:
+                continue
+            samples = _resample(samples, rate, sample_rate)
+            start = int(round(float(clip.get("start", 0)) * seconds_per_bar * sample_rate))
+            if start >= mix.size:
+                continue
+            length = samples.size
+            if clip.get("bars") is not None:
+                # honour the clip's length on the grid: trim, or pad with silence
+                wanted = int(round(float(clip["bars"]) * seconds_per_bar * sample_rate))
+                length = wanted
+                if samples.size > wanted:
+                    samples = samples[:wanted]
+                elif samples.size < wanted:
+                    samples = _pad_to(samples, wanted)
+            end = min(mix.size, start + length)
+            if end <= start:
+                continue
+            mix[start:end] += samples[: end - start] * track_gain * float(clip.get("gain", 1.0))
+            used.append({"part": track.get("name", "track"), "path": str(path)})
+
+    mix = _normalise(np.tanh(mix * 0.9), peak=0.94)
+    target = write_audio(out_path, mix, sample_rate, bit_depth=bit_depth, container=container)
+    return {
+        "schema_version": 1,
+        "mode": "mixdown",
+        "path": str(target),
+        "bpm": bpm,
+        "bars": bars,
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
+        "container": container,
+        "duration_ms": _duration_ms(mix.size, sample_rate),
+        "clip_count": len(used),
+        "tracks": used,
+        "warnings": [],
+    }
 
 
 def _main() -> int:  # pragma: no cover - manual runs

@@ -5,7 +5,7 @@ import sys
 
 from .cli import job_payload
 from .jobs import GenerationRequest, JobStore
-from .synth import render_part, render_song
+from .synth import mix_arrangement, render_part, render_song
 
 TOOLS = {
     "submit_generation": "Queue a Shadow Music Generator job. Dry-run validates the request and never runs a model.",
@@ -13,6 +13,7 @@ TOOLS = {
     "job_status": "Read one job: status, stages, outputs, model license and errors.",
     "render_part": "Render one musical part (drums/bass/chords/lead/pad) to a WAV file with the local synth.",
     "render_song": "Render a whole sketch — several parts plus a mix — to WAV files with the local synth.",
+    "mix_arrangement": "Bounce an arrangement of clips to one file, at a chosen sample rate and container (WAV/AIFF).",
 }
 
 SERVER_NAME = "shadow-music-generator"
@@ -45,6 +46,41 @@ def _schema(name: str) -> dict:
             },
             "required": ["prompt"],
             "additionalProperties": False,
+        }
+    if name == "mix_arrangement":
+        clip = {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "WAV file of this clip."},
+                "start": {"type": "number", "description": "Position in bars."},
+                "bars": {"type": "number", "description": "Length on the grid, in bars."},
+                "gain": {"type": "number"},
+            },
+            "required": ["path"],
+        }
+        return {
+            "type": "object",
+            "properties": {
+                "out_path": {"type": "string"},
+                "bpm": {"type": "number", "default": 120},
+                "bars": {"type": "number", "default": 8},
+                "sample_rate": {"type": "integer", "enum": [44100, 48000, 96000], "default": 44100},
+                "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
+                "container": {"type": "string", "enum": ["wav", "aiff"], "default": "wav"},
+                "tracks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "gain": {"type": "number"},
+                            "clips": {"type": "array", "items": clip},
+                        },
+                        "required": ["clips"],
+                    },
+                },
+            },
+            "required": ["out_path", "tracks"],
         }
     if name in ("render_part", "render_song"):
         note = {
@@ -188,6 +224,8 @@ def _run(name: str, arguments: dict) -> dict:
         return render_part(arguments)
     if name == "render_song":
         return render_song(arguments)
+    if name == "mix_arrangement":
+        return mix_arrangement(arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
