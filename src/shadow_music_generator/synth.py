@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import struct
+import subprocess
+import tempfile
 import wave
 from pathlib import Path
 
@@ -165,6 +168,28 @@ def write_audio(
     return target
 
 
+#: Containers an export can ask for. `m4a` is AAC, so it needs an encoder on the machine (afconvert
+#: ships with macOS, ffmpeg covers the rest); the PCM ones never do.
+CONTAINERS = ("wav", "aiff", "m4a")
+
+
+def _write_container(
+    path: "str | Path",
+    samples: np.ndarray,
+    rate: int,
+    bit_depth: int,
+    container: str,
+    bitrate: object = None,
+) -> Path:
+    """Write a bounce in the requested container, going through a temporary PCM file for `m4a`."""
+    target = Path(path).expanduser()
+    if container == "m4a":
+        with tempfile.TemporaryDirectory(prefix="shadow-export-") as tmp:
+            staged = write_audio(Path(tmp) / "bounce.wav", samples, rate, bit_depth=bit_depth, container="wav")
+            return _encode_lossy(staged, target, bitrate=int(bitrate) if isinstance(bitrate, (int, float)) and bitrate else 256000)
+    return write_audio(target, samples, rate, bit_depth=bit_depth, container=container)
+
+
 def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     """Linear resample — plenty for a mixdown, and no scipy dependency."""
     if samples.ndim == 2:
@@ -182,7 +207,19 @@ def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.nda
 
 
 def read_audio(path: "str | Path") -> "tuple[np.ndarray, int]":
-    """Read a PCM WAV as float frames: `(N,)` for mono, `(N, channels)` for interleaved."""
+    """Read a PCM WAV as float frames: `(N,)` for mono, `(N, channels)` for interleaved.
+
+    Python's `wave` module only understands the plain PCM headers; anything with a
+    `WAVE_FORMAT_EXTENSIBLE` header (format tag 0xFFFE) — which is what afconvert and most DAWs
+    write — falls through to `_read_riff_audio` below.
+    """
+    try:
+        return _read_wave_module(path)
+    except Exception:
+        return _read_riff_audio(path)
+
+
+def _read_wave_module(path: "str | Path") -> "tuple[np.ndarray, int]":
     with wave.open(str(Path(path).expanduser()), "rb") as handle:
         channels = handle.getnchannels()
         width = handle.getsampwidth()
@@ -202,6 +239,121 @@ def read_audio(path: "str | Path") -> "tuple[np.ndarray, int]":
     if channels > 1:
         data = data.reshape(-1, channels)
     return data, rate
+
+
+def _read_riff_audio(path: "str | Path") -> "tuple[np.ndarray, int]":
+    """Minimal RIFF/WAVE reader: PCM 8/16/24/32-bit and 32-bit float, extensible headers included.
+
+    Enough to read what `afconvert` decodes (it writes the extensible header) and what DAWs export,
+    without depending on a decoder library.
+    """
+    raw = Path(path).expanduser().read_bytes()
+    if raw[:4] != b"RIFF" or raw[8:12] != b"WAVE":
+        raise ValueError(f"not a RIFF/WAVE file: {path}")
+    offset = 12
+    fmt: "tuple[int, int, int, int] | None" = None
+    payload = b""
+    while offset + 8 <= len(raw):
+        chunk_id = raw[offset : offset + 4]
+        size = struct.unpack("<I", raw[offset + 4 : offset + 8])[0]
+        body = raw[offset + 8 : offset + 8 + size]
+        if chunk_id == b"fmt ":
+            tag, channels, rate = struct.unpack("<HHI", body[:8])
+            bits = struct.unpack("<H", body[14:16])[0]
+            if tag == 0xFFFE and len(body) >= 26:
+                tag = struct.unpack("<H", body[24:26])[0]  # the sub-format's own tag
+            fmt = (tag, channels, rate, bits)
+        elif chunk_id == b"data":
+            payload = body
+        offset += 8 + size + (size % 2)
+    if fmt is None or payload == b"":
+        raise ValueError(f"no audio data in {path}")
+    tag, channels, rate, bits = fmt
+    if tag == 3:
+        data = np.frombuffer(payload, dtype="<f4").astype(np.float32)
+    elif tag == 1 and bits == 8:
+        data = (np.frombuffer(payload, dtype="<u1").astype(np.float32) - 128.0) / 128.0
+    elif tag == 1 and bits == 16:
+        data = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+    elif tag == 1 and bits == 24:
+        packed = np.frombuffer(payload, dtype=np.uint8)
+        packed = packed[: (packed.size // 3) * 3].reshape(-1, 3)
+        values = packed[:, 0].astype(np.int32) | (packed[:, 1].astype(np.int32) << 8) | (packed[:, 2].astype(np.int32) << 16)
+        data = np.where(values >= 1 << 23, values - (1 << 24), values).astype(np.float32) / 8388608.0
+    elif tag == 1 and bits == 32:
+        data = np.frombuffer(payload, dtype="<i4").astype(np.float32) / 2147483648.0
+    else:
+        raise ValueError(f"unsupported WAV format tag {tag} ({bits}-bit) in {path}")
+    if channels > 1:
+        data = data[: (data.size // channels) * channels].reshape(-1, channels)
+    return data, rate
+
+
+def _decode_command() -> "tuple[str, ...] | None":
+    """The external decoder whose arguments we know, or `None` when there is none.
+
+    macOS ships `afconvert` (CoreAudio: mp3, m4a/aac, flac, aiff, caf…); ffmpeg is the same thing on
+    a Linux or Windows box. Neither is a dependency — the plugin just stops being able to read those
+    formats, and says so, when both are missing.
+    """
+    if (found := shutil.which("ffmpeg")) is not None:
+        return (found, "-v", "error", "-y", "-i")
+    if (found := shutil.which("afconvert")) is not None:
+        return (found, "-f", "WAVE", "-d", "LEI16", "-o")
+    return None
+
+
+def read_audio_any(path: "str | Path") -> "tuple[np.ndarray, int]":
+    """Read any clip the studio can hold: WAV directly, everything else through a decoder.
+
+    The mixdown used to skip anything it could not read with `wave`, so an imported mp3 simply was
+    not in the "export the song" result — silently. Now the read either works (CoreAudio/ffmpeg) or
+    raises, and the caller reports which clip it could not use.
+    """
+    target = Path(path).expanduser()
+    if target.suffix.lower() in (".wav", ".wave", ""):
+        try:
+            return read_audio(target)
+        except Exception:
+            pass
+    command = _decode_command()
+    if command is None:
+        raise ValueError(
+            f"cannot read {target.suffix or 'this file'} — install ffmpeg, or export it as WAV first"
+        )
+    with tempfile.TemporaryDirectory(prefix="shadow-audio-") as tmp:
+        decoded = Path(tmp) / "decoded.wav"
+        if command[0].endswith("afconvert"):
+            argv = [*command, str(decoded), str(target)]
+        else:
+            argv = [*command, str(target), str(decoded)]
+        result = subprocess.run(argv, capture_output=True, text=True)
+        if result.returncode != 0 or not decoded.exists():
+            detail = (result.stderr or result.stdout or "decoder failed").strip().splitlines()
+            raise ValueError(f"could not decode {target.name}: {detail[-1] if detail else 'unknown error'}")
+        return read_audio(decoded)
+
+
+def _encode_lossy(source: Path, target: Path, *, bitrate: int = 256000) -> Path:
+    """Encode a PCM file to AAC in an `.m4a`, through afconvert (macOS) or ffmpeg.
+
+    The project still ships no encoder of its own — but macOS has one built in, so refusing to write
+    an m4a when the machine can would be pretending rather than keeping a promise.
+    """
+    target.parent.mkdir(parents=True, exist_ok=True)
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is not None:
+        argv = [ffmpeg, "-v", "error", "-y", "-i", str(source), "-c:a", "aac", "-b:a", str(bitrate), str(target)]
+        result = subprocess.run(argv, capture_output=True, text=True)
+    elif (afconvert := shutil.which("afconvert")) is not None:
+        argv = [afconvert, "-f", "m4af", "-d", "aac", "-b", str(bitrate), str(source), str(target)]
+        result = subprocess.run(argv, capture_output=True, text=True)
+    else:
+        raise ValueError("m4a needs an AAC encoder: install ffmpeg (afconvert ships with macOS)")
+    if result.returncode != 0 or not target.exists():
+        detail = (result.stderr or result.stdout or "encoder failed").strip().splitlines()
+        raise ValueError(detail[-1] if detail else "the AAC encoder failed")
+    return target
 
 
 def read_wav(path: "str | Path") -> "tuple[np.ndarray, int]":
@@ -768,14 +920,14 @@ def mix_arrangement(spec: dict) -> dict:
     sample_rate = int(spec.get("sample_rate", SAMPLE_RATE))
     bit_depth = int(spec.get("bit_depth", 16))
     container = str(spec.get("container", "wav")).lower()
-    if container not in ("wav", "aiff"):
-        raise ValueError("container must be wav or aiff (lossy formats need an encoder)")
+    if container not in CONTAINERS:
+        raise ValueError(f"container must be one of {', '.join(CONTAINERS)}")
     seconds_per_bar = 60.0 / max(1.0, bpm) * 4
     total = int(round(bars * seconds_per_bar * sample_rate))
-    mix, used = _mix_tracks(spec.get("tracks") or [], sample_rate, seconds_per_bar, total)
+    mix, used, warnings = _mix_tracks(spec.get("tracks") or [], sample_rate, seconds_per_bar, total)
 
     mix = _normalise(np.tanh(mix * 0.9), peak=0.94)
-    target = write_audio(out_path, mix, sample_rate, bit_depth=bit_depth, container=container)
+    target = _write_container(out_path, mix, sample_rate, bit_depth, container, spec.get("bitrate"))
     return {
         "schema_version": 1,
         "mode": "mixdown",
@@ -783,13 +935,13 @@ def mix_arrangement(spec: dict) -> dict:
         "bpm": bpm,
         "bars": bars,
         "sample_rate": sample_rate,
-        "bit_depth": bit_depth,
+        "bit_depth": bit_depth if container != "m4a" else None,
         "container": container,
         "duration_ms": _duration_ms(mix.shape[0], sample_rate),
         "channels": mix.shape[1],
         "clip_count": len(used),
         "tracks": used,
-        "warnings": [],
+        "warnings": warnings,
     }
 
 
@@ -798,10 +950,15 @@ def _mix_tracks(
     sample_rate: int,
     seconds_per_bar: float,
     total: int,
-) -> "tuple[np.ndarray, list[dict]]":
-    """Sum the clips of `tracks` onto one buffer, honouring position, length and gains."""
+) -> "tuple[np.ndarray, list[dict], list[str]]":
+    """Sum the clips of `tracks` onto one buffer, honouring position, length and gains.
+
+    A clip the decoder cannot read is *reported*, never dropped in silence: an arrangement that
+    exports without the mp3 the user imported would look successful and be wrong.
+    """
     mix = np.zeros((max(1, total), 2), dtype=np.float32)
     used: "list[dict]" = []
+    warnings: "list[str]" = []
     for track in tracks:
         track_gain = float(track.get("gain", 1.0))
         if track_gain <= 0:
@@ -811,8 +968,9 @@ def _mix_tracks(
             if not path:
                 continue
             try:
-                samples, rate = read_audio(path)
-            except Exception:
+                samples, rate = read_audio_any(path)
+            except Exception as exc:
+                warnings.append(f"{Path(str(path)).name}: {exc}")
                 continue
             if samples.ndim == 1:
                 samples = np.stack([samples, samples], axis=1)
@@ -834,7 +992,7 @@ def _mix_tracks(
                 continue
             mix[start:end] += samples[: end - start] * track_gain * float(clip.get("gain", 1.0))
             used.append({"part": track.get("name", "track"), "path": str(path)})
-    return mix, used
+    return mix, used, warnings
 
 
 def export_stems(spec: dict) -> dict:
@@ -854,21 +1012,23 @@ def export_stems(spec: dict) -> dict:
     sample_rate = int(spec.get("sample_rate", SAMPLE_RATE))
     bit_depth = int(spec.get("bit_depth", 16))
     container = str(spec.get("container", "wav")).lower()
-    if container not in ("wav", "aiff"):
-        raise ValueError("container must be wav or aiff (lossy formats need an encoder)")
+    if container not in CONTAINERS:
+        raise ValueError(f"container must be one of {', '.join(CONTAINERS)}")
     seconds_per_bar = 60.0 / max(1.0, bpm) * 4
     total = int(round(bars * seconds_per_bar * sample_rate))
 
     stems: "list[dict]" = []
+    warnings: "list[str]" = []
     for index, track in enumerate(spec.get("tracks") or []):
         name = str(track.get("name") or f"track{index + 1}")
-        mix, used = _mix_tracks([track], sample_rate, seconds_per_bar, total)
+        mix, used, track_warnings = _mix_tracks([track], sample_rate, seconds_per_bar, total)
+        warnings.extend(track_warnings)
         if not used:
             continue
         samples = _normalise(np.tanh(mix * 0.9), peak=0.94)
         safe = "".join(character if character.isalnum() or character in "-_" else "-" for character in name)
         target = directory / f"{base}-{index + 1:02d}-{safe}.{container}"
-        write_audio(target, samples, sample_rate, bit_depth=bit_depth, container=container)
+        _write_container(target, samples, sample_rate, bit_depth, container, spec.get("bitrate"))
         stems.append(
             {
                 "name": name,
@@ -887,11 +1047,11 @@ def export_stems(spec: dict) -> dict:
         "bpm": bpm,
         "bars": bars,
         "sample_rate": sample_rate,
-        "bit_depth": bit_depth,
+        "bit_depth": bit_depth if container != "m4a" else None,
         "container": container,
         "stem_count": len(stems),
         "stems": stems,
-        "warnings": [],
+        "warnings": warnings,
     }
 
 

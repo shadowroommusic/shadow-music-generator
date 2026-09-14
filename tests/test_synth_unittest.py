@@ -12,14 +12,26 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from shadow_music_generator.synth import (
     NOTE_NAMES,
+    _encode_lossy,
     export_midi,
     export_stems,
+    mix_arrangement,
     note_name,
+    read_audio,
+    read_audio_any,
     read_midi_notes,
     render_part,
     render_song,
+    write_audio,
     write_midi_multitrack,
 )
+
+
+def decoder_available() -> bool:
+    """Whether this machine can decode/encode AAC — those tests skip cleanly when it cannot."""
+    import shutil
+
+    return shutil.which("ffmpeg") is not None or shutil.which("afconvert") is not None
 
 SKETCH = {
     "bpm": 128,
@@ -47,6 +59,12 @@ SKETCH = {
         },
     ],
 }
+
+
+#: One readable clip for the arrangement tests (written once, at import time).
+CLIP_WAV = str(Path(tempfile.gettempdir()) / "shadow-test-clip.wav")
+if not Path(CLIP_WAV).exists():
+    write_audio(Path(CLIP_WAV), (np.sin(np.arange(22050) / 25.0) * 0.5).astype("float32"), 44100)
 
 
 def read(path: str) -> "tuple[np.ndarray, int]":
@@ -322,6 +340,99 @@ class SynthTests(unittest.TestCase):
             # the bass only plays from the drop, one note per bar
             self.assertEqual(sum(1 for note in notes if note["midi"] == 33), 2)
             self.assertTrue(all(note["start_ms"] >= bar_ms - 1 for note in notes if note["midi"] == 33))
+
+    def test_read_audio_handles_extensible_wav_headers(self):
+        """afconvert and DAWs write `WAVE_FORMAT_EXTENSIBLE`, which Python's `wave` refuses."""
+        with tempfile.TemporaryDirectory() as tmp:
+            plain = Path(tmp) / "plain.wav"
+            write_audio(plain, np.sin(np.arange(4410) / 20.0).astype(np.float32) * 0.5, 44100)
+            raw = plain.read_bytes()
+            self.assertEqual(raw[12:16], b"fmt ")
+            fmt_size = struct.unpack("<I", raw[16:20])[0]
+            body = raw[20 : 20 + fmt_size]
+            channels = struct.unpack("<H", body[2:4])[0]
+            rate = struct.unpack("<I", body[4:8])[0]
+            bits = struct.unpack("<H", body[14:16])[0]
+            extended = (
+                struct.pack("<HHIIHH", 0xFFFE, channels, rate, rate * channels * bits // 8, channels * bits // 8, bits)
+                + struct.pack("<H", 22)  # cbSize
+                + struct.pack("<HI", bits, 1)  # wValidBitsPerSample, dwChannelMask
+                # SubFormat: KSDATAFORMAT_SUBTYPE_PCM, 00000001-0000-0010-8000-00aa00389b71
+                + struct.pack("<IHH", 1, 0, 0x0010)
+                + bytes([0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+            )
+            rest = raw[20 + fmt_size :]
+            rebuilt = (
+                b"RIFF"
+                + struct.pack("<I", len(raw))
+                + b"WAVE"
+                + b"fmt "
+                + struct.pack("<I", len(extended))
+                + extended
+                + rest
+            )
+            target = Path(tmp) / "extensible.wav"
+            target.write_bytes(rebuilt)
+            with self.assertRaises(Exception):
+                wave.open(str(target), "rb")
+            samples, read_rate = read_audio(target)
+            self.assertEqual(read_rate, 44100)
+            self.assertGreater(float(np.abs(samples).max()), 0.4)
+
+    def test_a_clip_that_cannot_be_read_is_reported_not_dropped(self):
+        spec = {
+            "out_path": "mix.wav",
+            "bpm": 120,
+            "bars": 2,
+            "tracks": [
+                {"name": "ok", "clips": [{"path": CLIP_WAV, "start": 0, "bars": 2}]},
+                {"name": "missing", "clips": [{"path": "/tmp/definitely-not-here-9f3a.flac", "start": 0, "bars": 2}]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = mix_arrangement({**spec, "out_path": str(Path(tmp) / "mix.wav")})
+            self.assertEqual(result["clip_count"], 1)
+            self.assertTrue(result["warnings"], "the unreadable clip has to be reported")
+            self.assertIn("definitely-not-here", result["warnings"][0])
+
+    @unittest.skipUnless(decoder_available(), "needs ffmpeg or afconvert")
+    def test_a_non_wav_clip_is_decoded_into_the_mix(self):
+        """An imported mp3/m4a has to be in the mixdown, not silently skipped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "tone.wav"
+            write_audio(source, np.sin(np.arange(44100) / 30.0).astype(np.float32) * 0.6, 44100)
+            compressed = _encode_lossy(source, Path(tmp) / "tone.m4a", bitrate=192000)
+            result = mix_arrangement(
+                {
+                    "out_path": str(Path(tmp) / "mix.wav"),
+                    "bpm": 120,
+                    "bars": 1,
+                    "tracks": [{"name": "imported", "clips": [{"path": str(compressed), "start": 0, "bars": 1}]}],
+                }
+            )
+            self.assertEqual(result["clip_count"], 1, result["warnings"])
+            mix, _ = read_audio(result["path"])
+            self.assertGreater(float(np.sqrt(np.mean(mix**2))), 0.05)
+
+    @unittest.skipUnless(decoder_available(), "needs ffmpeg or afconvert")
+    def test_m4a_export_writes_a_playable_aac_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "tone.wav"
+            write_audio(source, np.sin(np.arange(44100) / 30.0).astype(np.float32) * 0.6, 44100)
+            result = mix_arrangement(
+                {
+                    "out_path": str(Path(tmp) / "mix.m4a"),
+                    "bpm": 120,
+                    "bars": 1,
+                    "container": "m4a",
+                    "tracks": [{"name": "tone", "clips": [{"path": str(source), "start": 0, "bars": 1}]}],
+                }
+            )
+            self.assertTrue(result["path"].endswith(".m4a"))
+            self.assertIsNone(result["bit_depth"], "AAC has no bit depth")
+            decoded, rate = read_audio_any(result["path"])
+            self.assertEqual(rate, 44100)
+            self.assertGreater(float(np.sqrt(np.mean(decoded**2))), 0.05)
 
     def test_render_part_reports_bars_and_duration(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -22,7 +22,7 @@ TOOLS = {
 _CLIP_SCHEMA = {
     "type": "object",
     "properties": {
-        "path": {"type": "string", "description": "WAV clip (or .mid for MIDI export)."},
+        "path": {"type": "string", "description": "Audio clip — WAV, or mp3/m4a/flac/aiff through a decoder — or a .mid for MIDI export."},
         "start": {"type": "number", "description": "Position in bars."},
         "bars": {"type": "number", "description": "Length on the grid, in bars."},
         "gain": {"type": "number"},
@@ -97,7 +97,13 @@ def _schema(name: str) -> dict:
                 "out_path": {"type": "string"},
                 "sample_rate": {"type": "integer", "enum": [44100, 48000, 96000], "default": 44100},
                 "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
-                "container": {"type": "string", "enum": ["wav", "aiff"], "default": "wav"},
+                "container": {
+                    "type": "string",
+                    "enum": ["wav", "aiff", "m4a"],
+                    "default": "wav",
+                    "description": "wav / aiff are PCM; m4a is AAC and needs afconvert (macOS) or ffmpeg.",
+                },
+                "bitrate": {"type": "integer", "description": "AAC bitrate for container m4a (default 256000)."},
                 **_ARRANGEMENT_PROPERTIES,
             },
             "required": ["out_path", "tracks"],
@@ -110,7 +116,13 @@ def _schema(name: str) -> dict:
                 "name": {"type": "string", "description": "Prefix for the stem files."},
                 "sample_rate": {"type": "integer", "enum": [44100, 48000, 96000], "default": 44100},
                 "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
-                "container": {"type": "string", "enum": ["wav", "aiff"], "default": "wav"},
+                "container": {
+                    "type": "string",
+                    "enum": ["wav", "aiff", "m4a"],
+                    "default": "wav",
+                    "description": "wav / aiff are PCM; m4a is AAC and needs afconvert (macOS) or ffmpeg.",
+                },
+                "bitrate": {"type": "integer", "description": "AAC bitrate for container m4a (default 256000)."},
                 **_ARRANGEMENT_PROPERTIES,
             },
             "required": ["out_dir", "tracks"],

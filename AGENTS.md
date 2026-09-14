@@ -92,3 +92,12 @@ it), and together they are the toolkit that `producer-tools` bundles into one ap
   stems the workbench had already rendered (`night-drive-drums.wav`: bar 1 = 0.108 RMS, bars 2–8 =
   0.000). Rows now repeat across the part (16 steps = one bar, 32 = a two-bar block), and pitched
   parts gained `repeat` for the same reason: a written bar can cover an eight-bar part.
+
+- **2026-09-15 — clips are read through the machine's decoder, and m4a can be written.** The mixdown
+  silently skipped anything `wave` could not open, so an imported mp3 was missing from "export the
+  song" with no sign of it. `read_audio` now also parses extensible RIFF headers (what afconvert and
+  DAWs write), `read_audio_any` decodes mp3/m4a/flac/aiff through ffmpeg or afconvert, and an
+  unreadable clip is reported in `warnings`. `container: "m4a"` writes AAC through the same encoder —
+  the export dialog offers WAV / AIFF / M4A and no longer claims lossy formats are impossible.
+  Measured: an m4a clip mixed in (`clip_count` 1, decoded back at the source level), and a 48 kHz
+  m4a mix + stems that decode back with peak 0.945.

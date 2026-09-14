@@ -120,7 +120,14 @@ Three things about the arrangement model are worth keeping in mind when editing 
    2026-09-15: rows were placed once, so a 4-bar beat was one bar of audio followed by three bars of
    silence — measured on the workbench's own stems (`night-drive-drums.wav`, 8 bars: bar 1 = 0.108
    RMS, bars 2–8 = 0.000). Pitched parts keep the written positions unless `repeat` says otherwise.
-3. **The MIDI is the plan, not a transcription.** `song_midi_parts` reads the same spec through
+3. **Clips are read through whatever the machine has.** `read_audio` understands plain PCM and the
+   `WAVE_FORMAT_EXTENSIBLE` headers afconvert and DAWs write (`_read_riff_audio`, because Python's
+   `wave` module refuses tag 0xFFFE); anything else goes through `read_audio_any`, which shells out to
+   ffmpeg or afconvert and raises a readable error when neither exists. `_mix_tracks` turns that error
+   into a `warnings` entry — a mixdown that silently omitted an imported mp3 would look successful and
+   be wrong. `container: "m4a"` uses the same encoder in reverse (AAC, `bitrate` optional, no bit
+   depth), so the export dialog can offer a lossy format honestly instead of promising one.
+4. **The MIDI is the plan, not a transcription.** `song_midi_parts` reads the same spec through
    `_stretch_notes` — segments, repeats, sections — and writes it with `write_midi_multitrack`, drums
    on channel 10 (index 9). Swing is applied (it is part of the plan); `humanize_ms` is not, because
    it is random per hit and belongs to the performance.

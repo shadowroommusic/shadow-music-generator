@@ -95,7 +95,7 @@ python3 -m venv .venv
 | `job_status` | Read status, stages, outputs and errors for one job |
 | `render_part` | Render one part (drums / bass / chords / lead / pad) to a WAV with the local synth |
 | `render_song` | Render a whole arrangement: mix + one stem per part, optionally its MIDI (`midi_path`) |
-| `mix_arrangement` | Bounce an arrangement of clips to one file (WAV/AIFF, 44.1/48/96 kHz, 16/24-bit) |
+| `mix_arrangement` | Bounce an arrangement of clips to one file (WAV/AIFF, or M4A/AAC where an encoder exists, 44.1/48/96 kHz, 16/24-bit) |
 | `export_stems` | Bounce every track of an arrangement to its own file |
 | `export_midi` | Write an arrangement of notated clips (or `.mid` clips) as a Type-1 MIDI file |
 
@@ -145,6 +145,14 @@ audio. The plan is small on purpose:
   belongs to the performance).
 
 Every stem is exactly as long as the song, so the stems, the mix and the MIDI line up.
+
+### Clips it can read
+
+Arrangement clips can be WAV (plain or `WAVE_FORMAT_EXTENSIBLE`, 8/16/24/32-bit, PCM or float) or —
+through a decoder on the machine — mp3, m4a/aac, flac, aiff and the rest of the CoreAudio/ffmpeg
+family: macOS ships `afconvert`, everywhere else `ffmpeg` is enough. A clip that cannot be read is
+reported in the result's `warnings`, never dropped in silence, and `container: "m4a"` writes AAC
+through the same encoder (a `bitrate` is optional, `bit_depth` does not apply).
 
 ## Usage
 

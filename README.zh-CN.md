@@ -79,7 +79,7 @@ MCP 客户端配置：
 | `job_status` | 读取某个任务的状态、阶段、产物与错误 |
 | `render_part` | 用本地合成器把一个声部（drums / bass / chords / lead / pad）渲染成 WAV |
 | `render_song` | 渲染整首编曲：混音 + 每个声部一条分轨，可选同时写出 MIDI（`midi_path`） |
-| `mix_arrangement` | 把工程里的片段混成一个文件（WAV/AIFF，44.1/48/96 kHz，16/24-bit） |
+| `mix_arrangement` | 把工程里的片段混成一个文件（WAV/AIFF，装了编码器还能写 M4A/AAC；44.1/48/96 kHz，16/24-bit） |
 | `export_stems` | 把工程的每条轨道各导出一个文件（分轨） |
 | `export_midi` | 把带音符的片段（或指向 `.mid` 的片段）写成 Type-1 MIDI |
 
@@ -94,6 +94,10 @@ breakdown 里鼓就是这么消失的。鼓的 16 步一行 = 一小节，会自
 写成的音符只有 `repeat` 时才重复。带上 `midi_path` 时，同一份编曲会额外写成 MIDI（每个声部一轨、鼓在
 MIDI 第 10 通道，swing 也写进去，因为 swing 属于计划而不是演奏）。每条分轨都和整首一样长，所以分轨、
 混音、MIDI 完全对齐。
+
+片段能读 WAV（普通头或 `WAVE_FORMAT_EXTENSIBLE`，8/16/24/32 位、整数或浮点），也能通过系统解码器读
+mp3、m4a/aac、flac、aiff —— macOS 自带 `afconvert`，其它系统装 ffmpeg 即可。读不出来的片段会写进结果的
+`warnings`，不会悄悄丢掉；`container: "m4a"` 用同一个编码器写 AAC（可选 `bitrate`，AAC 没有位深）。
 
 ## 用法
 
