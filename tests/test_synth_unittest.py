@@ -434,6 +434,58 @@ class SynthTests(unittest.TestCase):
             self.assertEqual(rate, 44100)
             self.assertGreater(float(np.sqrt(np.mean(decoded**2))), 0.05)
 
+    def test_every_container_this_machine_claims_writes_a_real_file(self):
+        """The capability list is a promise: whatever it says is available must come out playable."""
+        from shadow_music_generator.synth import container_capabilities
+
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "tone.wav"
+            write_audio(source, np.sin(np.arange(44100) / 30.0).astype(np.float32) * 0.6, 44100)
+            for entry in container_capabilities():
+                if not entry["available"]:
+                    continue
+                target = Path(tmp) / f"mix.{entry['extension']}"
+                result = mix_arrangement(
+                    {
+                        "out_path": str(target),
+                        "bpm": 120,
+                        "bars": 1,
+                        "sample_rate": 44100,
+                        "container": entry["id"],
+                        "tracks": [{"name": "tone", "clips": [{"path": str(source), "start": 0, "bars": 1}]}],
+                    }
+                )
+                self.assertTrue(target.exists(), entry["id"])
+                self.assertGreater(target.stat().st_size, 1000, entry["id"])
+                if entry["lossy"]:
+                    self.assertIsNone(result["bit_depth"], entry["id"])
+                    self.assertEqual(result["bitrate"], entry["default_bitrate"], entry["id"])
+                decoded, rate = read_audio_any(target)
+                # Opus is defined at 48 kHz, so that is what it decodes back to
+                self.assertEqual(rate, 48000 if entry["id"] == "opus" else 44100, entry["id"])
+                self.assertGreater(float(np.sqrt(np.mean(decoded**2))), 0.05, entry["id"])
+                # one bar at 120 BPM is two seconds; a lossy codec adds a little padding on top
+                expected = 4 * 60 / 120
+                tolerance = 0.05 if entry["lossy"] else 0.005
+                self.assertLess(abs(decoded.shape[0] / rate - expected), tolerance, entry["id"])
+
+    def test_a_container_without_an_encoder_says_how_to_enable_it(self):
+        from unittest import mock
+
+        from shadow_music_generator.synth import _write_container
+
+        with tempfile.TemporaryDirectory() as tmp:
+            samples = np.zeros((4410, 2), dtype=np.float32)
+            with mock.patch("shadow_music_generator.synth.find_ffmpeg", return_value=None), mock.patch(
+                "shadow_music_generator.synth.find_afconvert", return_value=None
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    _write_container(Path(tmp) / "mix.mp3", samples, 44100, 16, "mp3")
+                self.assertIn("ffmpeg", str(caught.exception))
+                # …while an honest downgrade target still works
+                written = _write_container(Path(tmp) / "mix.wav", samples, 44100, 16, "wav")
+                self.assertTrue(Path(written).exists())
+
     def test_render_part_reports_bars_and_duration(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = render_part(

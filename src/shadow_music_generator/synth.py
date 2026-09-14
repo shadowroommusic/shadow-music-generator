@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import struct
 import subprocess
@@ -168,9 +169,87 @@ def write_audio(
     return target
 
 
-#: Containers an export can ask for. `m4a` is AAC, so it needs an encoder on the machine (afconvert
-#: ships with macOS, ffmpeg covers the rest); the PCM ones never do.
-CONTAINERS = ("wav", "aiff", "m4a")
+#: Containers an export can ask for, in the order the UI lists them.
+#:
+#: `wav`/`aiff` are written here and always work. `flac`/`alac`/`m4a` (AAC) work with either the
+#: encoder macOS ships (`afconvert`) or ffmpeg. `mp3`/`ogg`/`opus` need ffmpeg — CoreAudio has no MP3
+#: encoder, so offering one without it would be a lie rather than a feature.
+CONTAINERS = ("wav", "aiff", "flac", "alac", "m4a", "mp3", "ogg", "opus")
+#: Containers that lose information, with the default bitrate each encoder gets.
+LOSSY = {"m4a": 256000, "mp3": 320000, "ogg": 192000, "opus": 128000}
+#: Default ffmpeg/libav codec per container.
+FFMPEG_CODECS = {
+    "flac": ["-c:a", "flac"],
+    "alac": ["-c:a", "alac"],
+    "m4a": ["-c:a", "aac"],
+    "mp3": ["-c:a", "libmp3lame"],
+    "ogg": ["-c:a", "libvorbis"],
+    "opus": ["-c:a", "libopus"],
+}
+#: Default CoreAudio data format per container (`afconvert -d`).
+AFCONVERT_FORMATS = {"flac": "flac", "alac": "alac", "m4a": "aac"}
+#: Containers whose extension differs from their name.
+EXTENSIONS = {"alac": "m4a"}
+
+
+def find_ffmpeg() -> "str | None":
+    """ffmpeg from PATH, from the ShadowRoom `bin`, or from the imageio-ffmpeg wheel.
+
+    ShadowRoom keeps one static ffmpeg at `<home>/bin/ffmpeg` (a symlink to the imageio-ffmpeg
+    binary), which every plugin gets first on PATH; the import is only a fallback for a process that
+    started without that PATH.
+    """
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    home = Path(os.environ.get("SHADOWROOM_HOME") or Path.home() / "Documents" / "ShadowRoom")
+    staged = home / "bin" / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if staged.exists():
+        return str(staged)
+    try:
+        import imageio_ffmpeg  # type: ignore
+
+        return str(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        return None
+
+
+def find_afconvert() -> "str | None":
+    """macOS's own converter, when this is a Mac."""
+    return shutil.which("afconvert")
+
+
+def container_capabilities() -> "list[dict]":
+    """What this machine can actually write, for the export dialog and for error messages."""
+    ffmpeg = find_ffmpeg()
+    afconvert = find_afconvert()
+    out: "list[dict]" = []
+    for name in CONTAINERS:
+        if name in ("wav", "aiff"):
+            available, via = True, "built-in"
+        elif ffmpeg is not None:
+            available, via = True, "ffmpeg"
+        elif name in AFCONVERT_FORMATS and afconvert is not None:
+            available, via = True, "afconvert"
+        else:
+            available, via = False, "ffmpeg"
+        out.append(
+            {
+                "id": name,
+                "extension": EXTENSIONS.get(name, name),
+                "lossy": name in LOSSY,
+                "available": available,
+                "via": via,
+                "default_bitrate": LOSSY.get(name),
+            }
+        )
+    return out
+
+
+def _unsupported_message(container: str) -> str:
+    if container == "mp3":
+        return "MP3 needs an encoder: install ffmpeg (macOS has no MP3 encoder of its own)"
+    return f"{container} needs ffmpeg on this machine"
 
 
 def _write_container(
@@ -181,13 +260,43 @@ def _write_container(
     container: str,
     bitrate: object = None,
 ) -> Path:
-    """Write a bounce in the requested container, going through a temporary PCM file for `m4a`."""
+    """Write a bounce in the requested container, staged through a temporary PCM file when needed.
+
+    Every compressed format goes through ffmpeg when it exists (one code path, every codec); macOS's
+    afconvert covers flac/alac/aac when it does not. A format the machine cannot write raises with a
+    sentence that says how to enable it — never a silent downgrade.
+    """
+    container = container.lower()
+    if container not in CONTAINERS:
+        raise ValueError(f"container must be one of {', '.join(CONTAINERS)}")
     target = Path(path).expanduser()
-    if container == "m4a":
-        with tempfile.TemporaryDirectory(prefix="shadow-export-") as tmp:
-            staged = write_audio(Path(tmp) / "bounce.wav", samples, rate, bit_depth=bit_depth, container="wav")
-            return _encode_lossy(staged, target, bitrate=int(bitrate) if isinstance(bitrate, (int, float)) and bitrate else 256000)
-    return write_audio(target, samples, rate, bit_depth=bit_depth, container=container)
+    if container in ("wav", "aiff"):
+        return write_audio(target, samples, rate, bit_depth=bit_depth, container=container)
+    wanted = int(bitrate) if isinstance(bitrate, (int, float)) and bitrate else LOSSY.get(container)
+    ffmpeg = find_ffmpeg()
+    with tempfile.TemporaryDirectory(prefix="shadow-export-") as tmp:
+        staged = write_audio(Path(tmp) / "bounce.wav", samples, rate, bit_depth=24 if bit_depth == 24 else 16, container="wav")
+        if ffmpeg is not None:
+            argv = [ffmpeg, "-v", "error", "-y", "-i", str(staged), *FFMPEG_CODECS[container]]
+            if wanted and container in LOSSY:
+                argv += ["-b:a", str(wanted)]
+            argv.append(str(target))
+            result = subprocess.run(argv, capture_output=True, text=True)
+            if result.returncode == 0 and target.exists():
+                return target
+            detail = (result.stderr or "ffmpeg failed").strip().splitlines()
+            raise ValueError(f"ffmpeg could not write {container}: {detail[-1] if detail else 'unknown error'}")
+        afconvert = find_afconvert()
+        if afconvert is not None and container in AFCONVERT_FORMATS:
+            argv = [afconvert, "-f", "flac" if container == "flac" else "m4af", "-d", AFCONVERT_FORMATS[container], str(staged), str(target)]
+            if container == "m4a":
+                argv = [afconvert, "-f", "m4af", "-d", "aac", "-b", str(wanted or 256000), str(staged), str(target)]
+            result = subprocess.run(argv, capture_output=True, text=True)
+            if result.returncode == 0 and target.exists():
+                return target
+            detail = (result.stderr or "afconvert failed").strip().splitlines()
+            raise ValueError(f"afconvert could not write {container}: {detail[-1] if detail else 'unknown error'}")
+    raise ValueError(_unsupported_message(container))
 
 
 def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
@@ -935,7 +1044,8 @@ def mix_arrangement(spec: dict) -> dict:
         "bpm": bpm,
         "bars": bars,
         "sample_rate": sample_rate,
-        "bit_depth": bit_depth if container != "m4a" else None,
+        "bit_depth": None if container in LOSSY else bit_depth,
+        "bitrate": LOSSY.get(container) if container in LOSSY else None,
         "container": container,
         "duration_ms": _duration_ms(mix.shape[0], sample_rate),
         "channels": mix.shape[1],
@@ -1027,7 +1137,7 @@ def export_stems(spec: dict) -> dict:
             continue
         samples = _normalise(np.tanh(mix * 0.9), peak=0.94)
         safe = "".join(character if character.isalnum() or character in "-_" else "-" for character in name)
-        target = directory / f"{base}-{index + 1:02d}-{safe}.{container}"
+        target = directory / f"{base}-{index + 1:02d}-{safe}.{EXTENSIONS.get(container, container)}"
         _write_container(target, samples, sample_rate, bit_depth, container, spec.get("bitrate"))
         stems.append(
             {
@@ -1047,7 +1157,8 @@ def export_stems(spec: dict) -> dict:
         "bpm": bpm,
         "bars": bars,
         "sample_rate": sample_rate,
-        "bit_depth": bit_depth if container != "m4a" else None,
+        "bit_depth": None if container in LOSSY else bit_depth,
+        "bitrate": LOSSY.get(container) if container in LOSSY else None,
         "container": container,
         "stem_count": len(stems),
         "stems": stems,

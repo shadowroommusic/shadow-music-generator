@@ -330,7 +330,7 @@ class InterfaceTests(PipelineTestCase):
         self.assertEqual(payload["status"], "completed")
         self.assertEqual(payload["mode"], "dry-run")
 
-    def test_mcp_server_lists_three_tools(self) -> None:
+    def test_mcp_server_lists_every_tool(self) -> None:
         reply = mcp_server.handle({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
         self.assertEqual(
             [tool["name"] for tool in reply["result"]["tools"]],
@@ -343,6 +343,7 @@ class InterfaceTests(PipelineTestCase):
                 "mix_arrangement",
                 "export_stems",
                 "export_midi",
+                "list_export_formats",
             ],
         )
 

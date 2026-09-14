@@ -5,7 +5,14 @@ import sys
 
 from .cli import job_payload
 from .jobs import GenerationRequest, JobStore
-from .synth import export_midi, export_stems, mix_arrangement, render_part, render_song
+from .synth import (
+    container_capabilities,
+    export_midi,
+    export_stems,
+    mix_arrangement,
+    render_part,
+    render_song,
+)
 
 TOOLS = {
     "submit_generation": "Queue a Shadow Music Generator job. Dry-run validates the request and never runs a model.",
@@ -16,6 +23,7 @@ TOOLS = {
     "mix_arrangement": "Bounce an arrangement of clips to one file, at a chosen sample rate and container (WAV/AIFF).",
     "export_stems": "Bounce every track of an arrangement to its own file (stems).",
     "export_midi": "Write an arrangement of notated clips to a Type-1 MIDI file, one track per part.",
+    "list_export_formats": "Which containers this machine can write (wav/aiff always; flac/alac/aac and mp3/ogg/opus need an encoder).",
 }
 
 #: Clip shape shared by the arrangement tools.
@@ -74,6 +82,8 @@ EMPTY_RESULTS = {
 
 
 def _schema(name: str) -> dict:
+    if name == "list_export_formats":
+        return {"type": "object", "properties": {}, "additionalProperties": False}
     if name == "submit_generation":
         return {
             "type": "object",
@@ -99,11 +109,14 @@ def _schema(name: str) -> dict:
                 "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
                 "container": {
                     "type": "string",
-                    "enum": ["wav", "aiff", "m4a"],
+                    "enum": ["wav", "aiff", "flac", "alac", "m4a", "mp3", "ogg", "opus"],
                     "default": "wav",
-                    "description": "wav / aiff are PCM; m4a is AAC and needs afconvert (macOS) or ffmpeg.",
+                    "description": (
+                        "wav / aiff are written here; flac / alac / m4a(AAC) use afconvert (macOS) or ffmpeg; "
+                        "mp3 / ogg / opus need ffmpeg. Call list_export_formats to see what this machine has."
+                    ),
                 },
-                "bitrate": {"type": "integer", "description": "AAC bitrate for container m4a (default 256000)."},
+                "bitrate": {"type": "integer", "description": "Lossy bitrate (m4a default 256000, mp3 320000, ogg 192000, opus 128000)."},
                 **_ARRANGEMENT_PROPERTIES,
             },
             "required": ["out_path", "tracks"],
@@ -118,11 +131,14 @@ def _schema(name: str) -> dict:
                 "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
                 "container": {
                     "type": "string",
-                    "enum": ["wav", "aiff", "m4a"],
+                    "enum": ["wav", "aiff", "flac", "alac", "m4a", "mp3", "ogg", "opus"],
                     "default": "wav",
-                    "description": "wav / aiff are PCM; m4a is AAC and needs afconvert (macOS) or ffmpeg.",
+                    "description": (
+                        "wav / aiff are written here; flac / alac / m4a(AAC) use afconvert (macOS) or ffmpeg; "
+                        "mp3 / ogg / opus need ffmpeg. Call list_export_formats to see what this machine has."
+                    ),
                 },
-                "bitrate": {"type": "integer", "description": "AAC bitrate for container m4a (default 256000)."},
+                "bitrate": {"type": "integer", "description": "Lossy bitrate (m4a default 256000, mp3 320000, ogg 192000, opus 128000)."},
                 **_ARRANGEMENT_PROPERTIES,
             },
             "required": ["out_dir", "tracks"],
@@ -346,6 +362,8 @@ def _run(name: str, arguments: dict) -> dict:
         return mix_arrangement(arguments)
     if name == "export_stems":
         return export_stems(arguments)
+    if name == "list_export_formats":
+        return {"containers": container_capabilities()}
     if name == "export_midi":
         return export_midi(arguments)
     raise ValueError(f"Unknown tool: {name}")
