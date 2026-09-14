@@ -5,7 +5,7 @@ import sys
 
 from .cli import job_payload
 from .jobs import GenerationRequest, JobStore
-from .synth import mix_arrangement, render_part, render_song
+from .synth import export_midi, export_stems, mix_arrangement, render_part, render_song
 
 TOOLS = {
     "submit_generation": "Queue a Shadow Music Generator job. Dry-run validates the request and never runs a model.",
@@ -14,6 +14,49 @@ TOOLS = {
     "render_part": "Render one musical part (drums/bass/chords/lead/pad) to a WAV file with the local synth.",
     "render_song": "Render a whole sketch — several parts plus a mix — to WAV files with the local synth.",
     "mix_arrangement": "Bounce an arrangement of clips to one file, at a chosen sample rate and container (WAV/AIFF).",
+    "export_stems": "Bounce every track of an arrangement to its own file (stems).",
+    "export_midi": "Write an arrangement of notated clips to a Type-1 MIDI file, one track per part.",
+}
+
+#: Clip shape shared by the arrangement tools.
+_CLIP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "path": {"type": "string", "description": "WAV clip (or .mid for MIDI export)."},
+        "start": {"type": "number", "description": "Position in bars."},
+        "bars": {"type": "number", "description": "Length on the grid, in bars."},
+        "gain": {"type": "number"},
+        "notes": {
+            "type": "array",
+            "description": "Notated notes, milliseconds relative to the clip.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "midi": {"type": "integer"},
+                    "start_ms": {"type": "number"},
+                    "end_ms": {"type": "number"},
+                    "velocity": {"type": "integer"},
+                },
+                "required": ["midi", "start_ms", "end_ms"],
+            },
+        },
+    },
+}
+
+_TRACK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": "string"},
+        "gain": {"type": "number"},
+        "clips": {"type": "array", "items": _CLIP_SCHEMA},
+    },
+    "required": ["clips"],
+}
+
+_ARRANGEMENT_PROPERTIES = {
+    "bpm": {"type": "number", "default": 120},
+    "bars": {"type": "number", "default": 8},
+    "tracks": {"type": "array", "items": _TRACK_SCHEMA},
 }
 
 SERVER_NAME = "shadow-music-generator"
@@ -48,37 +91,36 @@ def _schema(name: str) -> dict:
             "additionalProperties": False,
         }
     if name == "mix_arrangement":
-        clip = {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "WAV file of this clip."},
-                "start": {"type": "number", "description": "Position in bars."},
-                "bars": {"type": "number", "description": "Length on the grid, in bars."},
-                "gain": {"type": "number"},
-            },
-            "required": ["path"],
-        }
         return {
             "type": "object",
             "properties": {
                 "out_path": {"type": "string"},
-                "bpm": {"type": "number", "default": 120},
-                "bars": {"type": "number", "default": 8},
                 "sample_rate": {"type": "integer", "enum": [44100, 48000, 96000], "default": 44100},
                 "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
                 "container": {"type": "string", "enum": ["wav", "aiff"], "default": "wav"},
-                "tracks": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": {"type": "string"},
-                            "gain": {"type": "number"},
-                            "clips": {"type": "array", "items": clip},
-                        },
-                        "required": ["clips"],
-                    },
-                },
+                **_ARRANGEMENT_PROPERTIES,
+            },
+            "required": ["out_path", "tracks"],
+        }
+    if name == "export_stems":
+        return {
+            "type": "object",
+            "properties": {
+                "out_dir": {"type": "string", "description": "Directory that receives one file per track."},
+                "name": {"type": "string", "description": "Prefix for the stem files."},
+                "sample_rate": {"type": "integer", "enum": [44100, 48000, 96000], "default": 44100},
+                "bit_depth": {"type": "integer", "enum": [16, 24], "default": 16},
+                "container": {"type": "string", "enum": ["wav", "aiff"], "default": "wav"},
+                **_ARRANGEMENT_PROPERTIES,
+            },
+            "required": ["out_dir", "tracks"],
+        }
+    if name == "export_midi":
+        return {
+            "type": "object",
+            "properties": {
+                "out_path": {"type": "string", "description": "MIDI file to write."},
+                **_ARRANGEMENT_PROPERTIES,
             },
             "required": ["out_path", "tracks"],
         }
@@ -226,6 +268,10 @@ def _run(name: str, arguments: dict) -> dict:
         return render_song(arguments)
     if name == "mix_arrangement":
         return mix_arrangement(arguments)
+    if name == "export_stems":
+        return export_stems(arguments)
+    if name == "export_midi":
+        return export_midi(arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 

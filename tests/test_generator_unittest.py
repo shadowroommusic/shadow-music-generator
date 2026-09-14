@@ -341,6 +341,8 @@ class InterfaceTests(PipelineTestCase):
                 "render_part",
                 "render_song",
                 "mix_arrangement",
+                "export_stems",
+                "export_midi",
             ],
         )
 

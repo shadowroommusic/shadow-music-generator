@@ -16,7 +16,17 @@ from pathlib import Path
 
 import numpy as np
 
-__all__ = ["mix_arrangement", "render_part", "render_song", "write_audio", "write_wav"]
+__all__ = [
+    "export_midi",
+    "export_stems",
+    "mix_arrangement",
+    "read_midi_notes",
+    "render_part",
+    "render_song",
+    "write_audio",
+    "write_midi_multitrack",
+    "write_wav",
+]
 
 SAMPLE_RATE = 44_100
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
@@ -399,10 +409,36 @@ def mix_arrangement(spec: dict) -> dict:
         raise ValueError("container must be wav or aiff (lossy formats need an encoder)")
     seconds_per_bar = 60.0 / max(1.0, bpm) * 4
     total = int(round(bars * seconds_per_bar * sample_rate))
+    mix, used = _mix_tracks(spec.get("tracks") or [], sample_rate, seconds_per_bar, total)
+
+    mix = _normalise(np.tanh(mix * 0.9), peak=0.94)
+    target = write_audio(out_path, mix, sample_rate, bit_depth=bit_depth, container=container)
+    return {
+        "schema_version": 1,
+        "mode": "mixdown",
+        "path": str(target),
+        "bpm": bpm,
+        "bars": bars,
+        "sample_rate": sample_rate,
+        "bit_depth": bit_depth,
+        "container": container,
+        "duration_ms": _duration_ms(mix.size, sample_rate),
+        "clip_count": len(used),
+        "tracks": used,
+        "warnings": [],
+    }
+
+
+def _mix_tracks(
+    tracks: "list[dict]",
+    sample_rate: int,
+    seconds_per_bar: float,
+    total: int,
+) -> "tuple[np.ndarray, list[dict]]":
+    """Sum the clips of `tracks` onto one buffer, honouring position, length and gains."""
     mix = np.zeros(max(1, total), dtype=np.float32)
     used: "list[dict]" = []
-
-    for track in spec.get("tracks") or []:
+    for track in tracks:
         track_gain = float(track.get("gain", 1.0))
         if track_gain <= 0:
             continue
@@ -432,22 +468,278 @@ def mix_arrangement(spec: dict) -> dict:
                 continue
             mix[start:end] += samples[: end - start] * track_gain * float(clip.get("gain", 1.0))
             used.append({"part": track.get("name", "track"), "path": str(path)})
+    return mix, used
 
-    mix = _normalise(np.tanh(mix * 0.9), peak=0.94)
-    target = write_audio(out_path, mix, sample_rate, bit_depth=bit_depth, container=container)
+
+def export_stems(spec: dict) -> dict:
+    """Bounce every track of the arrangement to its own file.
+
+    One file per studio track, in the requested rate / depth / container, so the parts can be taken
+    into a DAW or handed to a mastering stage separately.
+    """
+    out_dir = spec.get("out_dir") or spec.get("out_path")
+    if not out_dir:
+        raise ValueError("export_stems needs an out_dir")
+    directory = Path(out_dir).expanduser()
+    directory.mkdir(parents=True, exist_ok=True)
+    base = str(spec.get("name") or "stem").strip() or "stem"
+    bpm = float(spec.get("bpm", 120))
+    bars = float(spec.get("bars", 8))
+    sample_rate = int(spec.get("sample_rate", SAMPLE_RATE))
+    bit_depth = int(spec.get("bit_depth", 16))
+    container = str(spec.get("container", "wav")).lower()
+    if container not in ("wav", "aiff"):
+        raise ValueError("container must be wav or aiff (lossy formats need an encoder)")
+    seconds_per_bar = 60.0 / max(1.0, bpm) * 4
+    total = int(round(bars * seconds_per_bar * sample_rate))
+
+    stems: "list[dict]" = []
+    for index, track in enumerate(spec.get("tracks") or []):
+        name = str(track.get("name") or f"track{index + 1}")
+        mix, used = _mix_tracks([track], sample_rate, seconds_per_bar, total)
+        if not used:
+            continue
+        samples = _normalise(np.tanh(mix * 0.9), peak=0.94)
+        safe = "".join(character if character.isalnum() or character in "-_" else "-" for character in name)
+        target = directory / f"{base}-{index + 1:02d}-{safe}.{container}"
+        write_audio(target, samples, sample_rate, bit_depth=bit_depth, container=container)
+        stems.append(
+            {
+                "name": name,
+                "path": str(target),
+                "duration_ms": _duration_ms(samples.size, sample_rate),
+                "clip_count": len(used),
+            }
+        )
+    if not stems:
+        raise ValueError("no playable clips in this arrangement")
     return {
         "schema_version": 1,
-        "mode": "mixdown",
-        "path": str(target),
+        "mode": "stem-export",
+        "out_dir": str(directory),
         "bpm": bpm,
         "bars": bars,
         "sample_rate": sample_rate,
         "bit_depth": bit_depth,
         "container": container,
-        "duration_ms": _duration_ms(mix.size, sample_rate),
-        "clip_count": len(used),
-        "tracks": used,
+        "stem_count": len(stems),
+        "stems": stems,
         "warnings": [],
+    }
+
+
+def _vlq(value: int) -> bytes:
+    """MIDI variable-length quantity."""
+    value = max(0, int(value))
+    out = [value & 0x7F]
+    value >>= 7
+    while value:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    return bytes(reversed(out))
+
+
+def write_midi_multitrack(parts: "list[dict]", path: "str | Path", *, bpm: float = 120.0) -> Path:
+    """Write a Type-1 MIDI file: one track per part, notes in milliseconds.
+
+    `parts` entries are `{"name": str, "notes": [{"midi", "start_ms", "end_ms", "velocity"?}]}`.
+    """
+    ticks_per_beat = 480
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    micros_per_beat = int(round(60_000_000 / max(1.0, bpm)))
+
+    def to_ticks(ms: float) -> int:
+        return int(round(ms / 60000.0 * bpm * ticks_per_beat))
+
+    chunks: "list[bytes]" = []
+    # track 0: tempo + time signature, so the file lands on the right grid in any DAW
+    conductor = bytearray()
+    conductor += _vlq(0) + b"\xff\x51\x03" + struct.pack(">I", micros_per_beat)[1:]
+    conductor += _vlq(0) + b"\xff\x58\x04" + bytes([4, 2, 24, 8])
+    conductor += _vlq(0) + b"\xff\x2f\x00"
+    chunks.append(bytes(conductor))
+
+    for part in parts:
+        events: "list[tuple[int, int, bytes]]" = []
+        for order, note in enumerate(part.get("notes") or []):
+            midi = max(0, min(127, int(note.get("midi", 60))))
+            velocity = max(1, min(127, int(note.get("velocity", 100))))
+            start = to_ticks(float(note.get("start_ms", 0)))
+            end = max(start + 1, to_ticks(float(note.get("end_ms", 0))))
+            events.append((start, 1, bytes([0x90, midi, velocity])))
+            events.append((end, 0, bytes([0x80, midi, 64])))
+        events.sort(key=lambda item: (item[0], item[1]))
+        track = bytearray()
+        name = str(part.get("name") or "part").encode("utf-8")[:127]
+        track += _vlq(0) + b"\xff\x03" + _vlq(len(name)) + name
+        previous = 0
+        for tick, _order, payload in events:
+            track += _vlq(tick - previous)
+            previous = tick
+            track += payload
+        track += _vlq(0) + b"\xff\x2f\x00"
+        chunks.append(bytes(track))
+
+    header = b"MThd" + struct.pack(">IHHH", 6, 1, len(chunks), ticks_per_beat)
+    body = b"".join(b"MTrk" + struct.pack(">I", len(chunk)) + chunk for chunk in chunks)
+    target.write_bytes(header + body)
+    return target
+
+
+def read_midi_notes(path: "str | Path") -> "tuple[list[dict], float | None]":
+    """Read every note of a MIDI file as `{midi, start_ms, end_ms}`, plus its tempo if it has one."""
+    data = Path(path).expanduser().read_bytes()
+    if data[:4] != b"MThd":
+        raise ValueError("not a MIDI file")
+    _format, track_count, division = struct.unpack(">HHH", data[8:14])
+    ticks_per_beat = division or 480
+    offset = 14
+    tempo: float | None = None
+    notes: "list[dict]" = []
+    for _ in range(track_count):
+        if data[offset : offset + 4] != b"MTrk":
+            break
+        size = struct.unpack(">I", data[offset + 4 : offset + 8])[0]
+        end = offset + 8 + size
+        index = offset + 8
+        tick = 0
+        status = 0
+        sounding: "dict[int, tuple[int, int]]" = {}
+
+        def clock(ticks: int) -> float:
+            bpm = tempo or 120.0
+            return ticks / ticks_per_beat * (60_000.0 / bpm)
+
+        while index < end:
+            delta, index = _read_vlq(data, index)
+            tick += delta
+            byte = data[index]
+            if byte == 0xFF:
+                index += 1
+                kind = data[index]
+                index += 1
+                length, index = _read_vlq(data, index)
+                payload = data[index : index + length]
+                index += length
+                if kind == 0x51 and length == 3:
+                    tempo = 60_000_000 / int.from_bytes(payload, "big")
+                continue
+            if byte in (0xF0, 0xF7):
+                index += 1
+                length, index = _read_vlq(data, index)
+                index += length
+                continue
+            if byte & 0x80:
+                status = byte
+                index += 1
+            command = status & 0xF0
+            if command in (0x80, 0x90):
+                note = data[index]
+                velocity = data[index + 1]
+                index += 2
+                if command == 0x90 and velocity > 0:
+                    sounding[note] = (tick, velocity)
+                else:
+                    started = sounding.pop(note, None)
+                    if started is not None:
+                        notes.append(
+                            {
+                                "midi": note,
+                                "velocity": started[1],
+                                "start_ms": clock(started[0]),
+                                "end_ms": clock(tick),
+                            }
+                        )
+                continue
+            if command in (0xA0, 0xB0, 0xE0):
+                index += 2
+                continue
+            if command in (0xC0, 0xD0):
+                index += 1
+                continue
+            break
+        offset = end
+    notes.sort(key=lambda note: note["start_ms"])
+    return notes, tempo
+
+
+def _read_vlq(data: bytes, index: int) -> "tuple[int, int]":
+    value = 0
+    while True:
+        byte = data[index]
+        index += 1
+        value = (value << 7) | (byte & 0x7F)
+        if not byte & 0x80:
+            return value, index
+
+
+def export_midi(spec: dict) -> dict:
+    """Write the arrangement as MIDI: one track per studio track, notes placed on the grid.
+
+    A clip contributes notes either directly (`notes`, milliseconds relative to the clip — what the
+    hum-to-MIDI flow attaches) or by pointing at a `.mid` file, which is parsed. Audio-only clips are
+    reported back so the UI can say what could not be notated.
+    """
+    out_path = spec.get("out_path")
+    if not out_path:
+        raise ValueError("export_midi needs an out_path")
+    bpm = float(spec.get("bpm", 120))
+    seconds_per_bar = 60.0 / max(1.0, bpm) * 4
+    parts: "list[dict]" = []
+    skipped: "list[str]" = []
+    for index, track in enumerate(spec.get("tracks") or []):
+        name = str(track.get("name") or f"track{index + 1}")
+        notes: "list[dict]" = []
+        for clip in track.get("clips") or []:
+            offset_ms = float(clip.get("start", 0)) * seconds_per_bar * 1000
+            clip_notes = clip.get("notes")
+            if clip_notes:
+                for note in clip_notes:
+                    notes.append(
+                        {
+                            "midi": int(note.get("midi", 60)),
+                            "start_ms": offset_ms + float(note.get("start_ms", 0)),
+                            "end_ms": offset_ms + float(note.get("end_ms", 0)),
+                            "velocity": int(note.get("velocity", 100)),
+                        }
+                    )
+                continue
+            path = str(clip.get("path") or "")
+            if path.lower().endswith((".mid", ".midi")):
+                try:
+                    parsed, _tempo = read_midi_notes(path)
+                except Exception:
+                    skipped.append(f"{name}: {Path(path).name} (unreadable MIDI)")
+                    continue
+                for note in parsed:
+                    notes.append(
+                        {
+                            "midi": note["midi"],
+                            "start_ms": offset_ms + note["start_ms"],
+                            "end_ms": offset_ms + note["end_ms"],
+                            "velocity": note.get("velocity", 100),
+                        }
+                    )
+                continue
+            if path:
+                skipped.append(f"{name}: {Path(path).name} (audio — run hum_to_midi first)")
+        if notes:
+            parts.append({"name": name, "notes": notes})
+    if not parts:
+        raise ValueError("nothing to notate: no clip carries notes or MIDI")
+    target = write_midi_multitrack(parts, out_path, bpm=bpm)
+    return {
+        "schema_version": 1,
+        "mode": "midi-export",
+        "path": str(target),
+        "bpm": bpm,
+        "bars": float(spec.get("bars", 8)),
+        "track_count": len(parts),
+        "note_count": sum(len(part["notes"]) for part in parts),
+        "tracks": [{"name": part["name"], "notes": len(part["notes"])} for part in parts],
+        "skipped": skipped,
+        "warnings": skipped[:3],
     }
 
 

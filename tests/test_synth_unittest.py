@@ -1,3 +1,4 @@
+import struct
 import sys
 import tempfile
 import unittest
@@ -8,7 +9,16 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from shadow_music_generator.synth import NOTE_NAMES, note_name, render_part, render_song
+from shadow_music_generator.synth import (
+    NOTE_NAMES,
+    export_midi,
+    export_stems,
+    note_name,
+    read_midi_notes,
+    render_part,
+    render_song,
+    write_midi_multitrack,
+)
 
 SKETCH = {
     "bpm": 128,
@@ -99,6 +109,109 @@ class SynthTests(unittest.TestCase):
         self.assertEqual(note_name(60), "C4")
         self.assertEqual(note_name(36), "C2")
         self.assertEqual(NOTE_NAMES[69 % 12], "A")
+
+
+class ExportTests(unittest.TestCase):
+    def test_stems_write_one_file_per_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            song = render_song({**SKETCH, "out_path": str(Path(tmp) / "sketch.wav")})
+            result = export_stems(
+                {
+                    "out_dir": str(Path(tmp) / "stems"),
+                    "name": "sketch",
+                    "bpm": SKETCH["bpm"],
+                    "bars": SKETCH["bars"],
+                    "sample_rate": 48000,
+                    "bit_depth": 24,
+                    "tracks": [
+                        {"name": part["part"], "clips": [{"path": part["path"], "start": 0}]}
+                        for part in song["parts"]
+                    ],
+                }
+            )
+            self.assertEqual(result["stem_count"], len(song["parts"]))
+            self.assertEqual(result["sample_rate"], 48000)
+            for stem in result["stems"]:
+                samples, rate = read(stem["path"])
+                self.assertEqual(rate, 48000)
+                self.assertGreater(float(np.abs(samples).max()), 0.1)
+                self.assertEqual(stem["clip_count"], 1)
+
+    def test_stems_skip_empty_tracks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                export_stems(
+                    {
+                        "out_dir": str(Path(tmp) / "stems"),
+                        "tracks": [{"name": "空", "clips": []}],
+                    }
+                )
+
+    def test_midi_export_round_trips_through_the_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = export_midi(
+                {
+                    "out_path": str(Path(tmp) / "parts.mid"),
+                    "bpm": 120,
+                    "bars": 4,
+                    "tracks": [
+                        {
+                            "name": "bass",
+                            "clips": [
+                                {
+                                    "start": 1,
+                                    "notes": [
+                                        {"midi": 36, "start_ms": 0, "end_ms": 400},
+                                        {"midi": 43, "start_ms": 500, "end_ms": 900},
+                                    ],
+                                }
+                            ],
+                        },
+                        {
+                            "name": "lead",
+                            "clips": [{"start": 0, "notes": [{"midi": 72, "start_ms": 200, "end_ms": 600}]}],
+                        },
+                    ],
+                }
+            )
+            self.assertEqual(result["track_count"], 2)
+            self.assertEqual(result["note_count"], 3)
+            notes, tempo = read_midi_notes(result["path"])
+            self.assertAlmostEqual(tempo or 0, 120.0, places=1)
+            # one bar at 120 BPM = 2000 ms, so the bass notes land there
+            self.assertEqual([note["midi"] for note in notes], [72, 36, 43])
+            self.assertAlmostEqual(notes[0]["start_ms"], 200, delta=5)
+            self.assertAlmostEqual(notes[1]["start_ms"], 2000, delta=5)
+            self.assertAlmostEqual(notes[2]["start_ms"], 2500, delta=5)
+
+    def test_midi_export_reports_audio_only_clips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            song = render_song({**SKETCH, "out_path": str(Path(tmp) / "sketch.wav")})
+            result = export_midi(
+                {
+                    "out_path": str(Path(tmp) / "mixed.mid"),
+                    "bpm": 120,
+                    "tracks": [
+                        {"name": "drums", "clips": [{"path": song["parts"][0]["path"], "start": 0}]},
+                        {"name": "lead", "clips": [{"notes": [{"midi": 60, "start_ms": 0, "end_ms": 300}]}]},
+                    ],
+                }
+            )
+            self.assertEqual(result["track_count"], 1)
+            self.assertTrue(any("audio" in entry for entry in result["skipped"]))
+
+    def test_multitrack_midi_is_type_one_with_a_tempo_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = write_midi_multitrack(
+                [{"name": "a", "notes": [{"midi": 60, "start_ms": 0, "end_ms": 500}]}],
+                Path(tmp) / "one.mid",
+                bpm=124,
+            )
+            data = target.read_bytes()
+            self.assertEqual(data[:4], b"MThd")
+            self.assertEqual(struct.unpack(">HHH", data[8:14]), (1, 2, 480))  # type 1, tempo + 1 part
+            _notes, tempo = read_midi_notes(target)
+            self.assertAlmostEqual(tempo or 0, 124.0, places=1)
 
 
 if __name__ == "__main__":
