@@ -153,6 +153,10 @@ def _schema(name: str) -> dict:
                 "delay_feedback": {"type": "number", "default": 0.28},
                 "swing": {"type": "number", "description": "0–1; pushes the offbeat sixteenths later (drums)."},
                 "humanize_ms": {"type": "number", "description": "Random timing spread per hit, in ms (drums)."},
+                "repeat": {
+                    "type": ["boolean", "number"],
+                    "description": "Tile the written notes until the part is full (true) or that many times (a number).",
+                },
                 "notes": {"type": "array", "items": note, "description": "For pitched parts."},
                 "pattern": {
                     "type": "object",
@@ -160,6 +164,36 @@ def _schema(name: str) -> dict:
                     "additionalProperties": {"type": "string"},
                 },
                 "steps": {"type": "integer", "default": 16},
+                "segments": {
+                    "type": "array",
+                    "description": (
+                        "Arrange the part over time: each entry is a stretch of bars rendered with the "
+                        "part's settings as defaults and its own keys overriding them, then concatenated. "
+                        "`{\"bars\": 8, \"gain\": 0}` (or silent: true) leaves that stretch empty."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "bars": {"type": "number", "description": "Length of this stretch, in bars."},
+                            "silent": {"type": "boolean", "description": "Leave this stretch empty."},
+                            "gain": {"type": "number"},
+                            "pattern": {
+                                "type": "object",
+                                "additionalProperties": {"type": "string"},
+                            },
+                            "notes": {"type": "array", "items": note},
+                            "wave": {"type": "string", "enum": ["sine", "triangle", "square", "saw"]},
+                            "cutoff": {"type": "number"},
+                            "pan": {"type": "number"},
+                            "reverb": {"type": "number"},
+                            "delay": {"type": "number"},
+                            "swing": {"type": "number"},
+                            "humanize_ms": {"type": "number"},
+                            "repeat": {"type": ["boolean", "number"]},
+                        },
+                        "required": ["bars"],
+                    },
+                },
                 "out_path": {"type": "string"},
             },
             "required": ["part"],
@@ -179,8 +213,30 @@ def _schema(name: str) -> dict:
             "type": "object",
             "properties": {
                 "out_path": {"type": "string", "description": "Mixed WAV to write; stems land beside it."},
+                "midi_path": {
+                    "type": "string",
+                    "description": (
+                        "Optional .mid to write as well: the same arrangement as notes (one track per part, "
+                        "drums on MIDI's drum channel), notated from the plan rather than transcribed."
+                    ),
+                },
                 "bpm": {"type": "number", "default": 120},
                 "bars": {"type": "number", "default": 4},
+                "sections": {
+                    "type": "array",
+                    "description": (
+                        "The song's shape, in order (`intro` 8, `drop` 16, …). It names the timeline and, "
+                        "when `bars` is not given, its lengths add up to the song's length."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "bars": {"type": "number"},
+                        },
+                        "required": ["name", "bars"],
+                    },
+                },
                 "parts": {"type": "array", "items": part, "minItems": 1},
             },
             "required": ["out_path", "parts"],

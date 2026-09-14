@@ -22,6 +22,10 @@ runs wherever your adapter points it: a local GPU machine, a rented box over ssh
   `SHADOW_PIPELINE_FACTORY`; the plugin just sequences the stages.
 - **License aware.** The model license is recorded in every job result, and no weights are
   downloaded or bundled.
+- **A local synth you can actually arrange with.** `render_song` writes a mix and one stem per part
+  from a plain JSON plan: step patterns and notes, sections (`intro` / `drop` / …), per-section
+  segments, and — when asked — the same arrangement as a Type-1 MIDI file, notated from the plan
+  rather than transcribed from the audio.
 
 ## Current scope
 
@@ -89,8 +93,58 @@ python3 -m venv .venv
 | `submit_generation` | Queue a job (`prompt`, `mode`, `model`, `lyrics`, `source_audio`, `output_dir`, `job_dir`, `run`) |
 | `run_job` | Run a queued job, optionally with a `factory` override |
 | `job_status` | Read status, stages, outputs and errors for one job |
+| `render_part` | Render one part (drums / bass / chords / lead / pad) to a WAV with the local synth |
+| `render_song` | Render a whole arrangement: mix + one stem per part, optionally its MIDI (`midi_path`) |
+| `mix_arrangement` | Bounce an arrangement of clips to one file (WAV/AIFF, 44.1/48/96 kHz, 16/24-bit) |
+| `export_stems` | Bounce every track of an arrangement to its own file |
+| `export_midi` | Write an arrangement of notated clips (or `.mid` clips) as a Type-1 MIDI file |
 
 CLI equivalents: `shadow-music-generator submit`, `run`, `status`, `list`.
+
+### The local synth
+
+`render_song` is what a sentence like *"a 32-bar tech house: intro 8, drop 16, outro 8"* turns into
+audio. The plan is small on purpose:
+
+```json
+{
+  "out_path": "~/Music/drive.wav",
+  "midi_path": "~/Music/drive.mid",
+  "bpm": 126,
+  "sections": [{"name": "intro", "bars": 8}, {"name": "drop", "bars": 16}, {"name": "outro", "bars": 8}],
+  "parts": [
+    {
+      "part": "drums", "swing": 0.14, "humanize_ms": 16,
+      "segments": [
+        {"bars": 8,  "pattern": {"hat": "..x...x...x...x."}},
+        {"bars": 16, "pattern": {"kick": "x...x...x...x...", "clap": "....x.......x...", "hat": "..x...x...x...x."}},
+        {"bars": 8,  "pattern": {"kick": "x...x...x...x...", "hat": "..x...x...x...x."}}
+      ]
+    },
+    {
+      "part": "bass", "wave": "saw", "cutoff": 0.32, "repeat": true,
+      "segments": [
+        {"bars": 8,  "gain": 0},
+        {"bars": 16, "notes": [{"midi": 33, "start": 0, "length": 0.75}]},
+        {"bars": 8,  "gain": 0}
+      ]
+    }
+  ]
+}
+```
+
+- **Segments** arrange a part over time: each entry is a stretch of bars rendered with the part's
+  settings as defaults and its own keys overriding them, then concatenated. `{"bars": 8, "gain": 0}`
+  (or `silent: true`) leaves the stretch empty — that is how a breakdown loses its drums.
+- **Sections** name the timeline and, when `bars` is not given, their lengths add up to the song.
+  They come back in the report, so a host app can draw the song's shape.
+- **Drums tile.** A 16-step row is one bar and repeats across the part; a 32-step row is a two-bar
+  block. Pitched parts repeat their written notes only when `repeat` asks for it.
+- **`midi_path`** writes the arrangement as notes as well: one MIDI track per part, drums on MIDI's
+  drum channel (10), and swing applied — swing is part of the plan, humanised timing is not (that
+  belongs to the performance).
+
+Every stem is exactly as long as the song, so the stems, the mix and the MIDI line up.
 
 ## Usage
 

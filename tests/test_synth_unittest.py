@@ -1,5 +1,6 @@
 import struct
 import sys
+from collections import Counter
 import tempfile
 import unittest
 import wave
@@ -87,6 +88,83 @@ def read_stereo(path: str) -> "tuple[np.ndarray, int]":
 
 
 class SynthTests(unittest.TestCase):
+    def test_a_drum_pattern_covers_every_bar_of_the_part(self):
+        """The bug that made every rendered beat one bar of audio: rows were placed once.
+
+        Measured on the workbench's own stems before the fix (`night-drive-drums.wav`, 8 bars):
+        bar 1 = 0.108 RMS, bars 2–8 = 0.000.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            result = render_part(
+                {
+                    "out_path": str(Path(tmp) / "beat.wav"),
+                    "part": "drums",
+                    "bpm": 120,
+                    "bars": 4,
+                    "pattern": {"kick": "x...x...x...x...", "hat": "..x...x...x...x."},
+                }
+            )
+            samples, rate = read(result["path"])
+            per_bar = samples.size // 4
+            levels = [
+                float(np.sqrt(np.mean(samples[index * per_bar : (index + 1) * per_bar] ** 2)))
+                for index in range(4)
+            ]
+            for index, level in enumerate(levels, start=1):
+                self.assertGreater(level, 0.05, f"bar {index} is silent: {levels}")
+            self.assertLess(max(levels) - min(levels), 0.02, f"bars differ: {levels}")
+
+    def test_a_multi_bar_row_tiles_as_its_own_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = render_part(
+                {
+                    "out_path": str(Path(tmp) / "two-bar.wav"),
+                    "part": "drums",
+                    "bpm": 120,
+                    "bars": 4,
+                    "steps": 32,
+                    "pattern": {
+                        # a two-bar block: a kick on every beat, an extra hit only in bar 2
+                        "kick": "x...x...x...x..." + "x...x...x..x.x..",
+                    },
+                }
+            )
+            samples, _ = read(result["path"])
+            per_bar = samples.size // 4
+            levels = [
+                float(np.sqrt(np.mean(samples[index * per_bar : (index + 1) * per_bar] ** 2)))
+                for index in range(4)
+            ]
+            self.assertGreater(min(levels), 0.02, f"a bar of the block is empty: {levels}")
+            # bars 1/3 came from the same half of the block, bars 2/4 from the other
+            self.assertAlmostEqual(levels[0], levels[2], delta=0.01)
+            self.assertAlmostEqual(levels[1], levels[3], delta=0.01)
+
+    def test_written_notes_repeat_when_asked(self):
+        notes = [{"midi": 33, "start": 0, "length": 0.75}, {"midi": 36, "start": 3, "length": 0.5}]
+        with tempfile.TemporaryDirectory() as tmp:
+            once = render_part(
+                {"out_path": str(Path(tmp) / "once.wav"), "part": "bass", "bpm": 120, "bars": 4, "notes": notes}
+            )
+            twice = render_part(
+                {
+                    "out_path": str(Path(tmp) / "twice.wav"),
+                    "part": "bass",
+                    "bpm": 120,
+                    "bars": 4,
+                    "repeat": True,
+                    "notes": notes,
+                }
+            )
+            plain, _ = read(once["path"])
+            repeated, _ = read(twice["path"])
+            per_bar = plain.size // 4
+            third = float(np.sqrt(np.mean(plain[2 * per_bar : 3 * per_bar] ** 2)))
+            self.assertLess(third, 0.01, "without repeat the third bar should hold what was written")
+            for index in range(4):
+                level = float(np.sqrt(np.mean(repeated[index * per_bar : (index + 1) * per_bar] ** 2)))
+                self.assertGreater(level, 0.02, f"bar {index + 1} of the repeat is empty")
+
     def test_render_song_writes_a_mix_and_one_stem_per_part(self):
         with tempfile.TemporaryDirectory() as tmp:
             result = render_song({**SKETCH, "out_path": str(Path(tmp) / "sketch.wav")})
@@ -112,6 +190,138 @@ class SynthTests(unittest.TestCase):
             for name, stem in stems.items():
                 correlation = float(np.dot(mix, stem) / (np.linalg.norm(mix) * np.linalg.norm(stem) + 1e-9))
                 self.assertGreater(correlation, 0.1, f"{name} is missing from the mix")
+
+    def test_sections_and_segments_render_a_song_with_dynamics(self):
+        """The shape a natural-language song request maps to: intro → drop → break → drop 2."""
+        arrangement = {
+            "out_path": "song.wav",
+            "bpm": 124,
+            "sections": [
+                {"name": "intro", "bars": 2},
+                {"name": "drop", "bars": 4},
+                {"name": "break", "bars": 2},
+                {"name": "drop 2", "bars": 2},
+            ],
+            "parts": [
+                {
+                    "part": "drums",
+                    "segments": [
+                        {"bars": 2, "pattern": {"hat": "..x...x...x...x."}},
+                        {
+                            "bars": 4,
+                            "pattern": {
+                                "kick": "x...x...x...x...",
+                                "clap": "....x.......x...",
+                                "hat": "..x...x...x...x.",
+                            },
+                        },
+                        {"bars": 2, "gain": 0},
+                        {
+                            "bars": 2,
+                            "pattern": {
+                                "kick": "x...x...x...x...",
+                                "clap": "....x.......x...",
+                                "hat": "..x...x...x...x.",
+                            },
+                        },
+                    ],
+                },
+                {
+                    "part": "bass",
+                    "wave": "saw",
+                    "repeat": True,
+                    "segments": [
+                        {"bars": 2, "gain": 0},
+                        {"bars": 4, "notes": [{"midi": 33, "start": 0, "length": 0.75}]},
+                        {"bars": 2, "gain": 0},
+                        {"bars": 2, "notes": [{"midi": 33, "start": 0, "length": 0.75}]},
+                    ],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = render_song({**arrangement, "out_path": str(Path(tmp) / "song.wav")})
+            # the sections set the song's length: 2 + 4 + 2 + 2 bars
+            self.assertEqual([entry["name"] for entry in result["sections"]], ["intro", "drop", "break", "drop 2"])
+            self.assertEqual([entry["start_bar"] for entry in result["sections"]], [0, 2, 6, 8])
+            self.assertEqual(result["bars"], 10)
+            # 10 bars of 4/4 at 124 BPM
+            self.assertAlmostEqual(result["duration_ms"] / 1000, 10 * 4 * 60 / 124, places=2)
+            for part in result["parts"]:
+                self.assertEqual(len(part["segments"]), 4)
+                self.assertEqual(part["duration_ms"], result["duration_ms"])
+
+            mix, rate = read(result["path"])
+            per_bar = mix.size // 10
+            level = lambda index: float(np.sqrt(np.mean(mix[index * per_bar : (index + 1) * per_bar] ** 2)))
+            intro = sum(level(index) for index in range(0, 2)) / 2
+            drop = sum(level(index) for index in range(2, 6)) / 4
+            silence = max(level(index) for index in range(6, 8))
+            second = sum(level(index) for index in range(8, 10)) / 2
+            self.assertGreater(intro, 0.005, "the intro should be there, just quieter")
+            self.assertGreater(drop, intro * 3, f"the drop ({drop}) must lift the intro ({intro})")
+            self.assertLess(silence, 0.001, f"the break should be empty, got {silence}")
+            self.assertAlmostEqual(second, drop, delta=0.05)
+            # the stems line up with the mix, so the Studio's meters agree with the timeline
+            for part in result["parts"]:
+                stem, _ = read(part["path"])
+                self.assertEqual(stem.size, mix.size)
+            drums, _ = read(result["parts"][0]["path"])
+            drums_break = max(float(np.sqrt(np.mean(drums[index * per_bar : (index + 1) * per_bar] ** 2))) for index in (6, 7))
+            self.assertLess(drums_break, 0.001, "the drums are out for the break")
+
+    def test_a_render_can_hand_back_its_own_midi(self):
+        """`midi_path` writes the plan that was played — not a transcription of the audio."""
+        arrangement = {
+            "out_path": "song.wav",
+            "midi_path": "song.mid",
+            "bpm": 120,
+            "sections": [{"name": "intro", "bars": 1}, {"name": "drop", "bars": 2}],
+            "parts": [
+                {
+                    "part": "drums",
+                    "segments": [
+                        {"bars": 1, "pattern": {"hat": "..x...x...x...x."}},
+                        {"bars": 2, "pattern": {"kick": "x...x...x...x...", "hat": "..x...x...x...x."}},
+                    ],
+                },
+                {
+                    "part": "bass",
+                    "wave": "saw",
+                    "repeat": True,
+                    "segments": [
+                        {"bars": 1, "gain": 0},
+                        {"bars": 2, "notes": [{"midi": 33, "start": 0, "length": 1}]},
+                    ],
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            result = render_song(
+                {
+                    **arrangement,
+                    "out_path": str(Path(tmp) / "song.wav"),
+                    "midi_path": str(Path(tmp) / "song.mid"),
+                }
+            )
+            self.assertIsNotNone(result["midi_path"])
+            notes, tempo = read_midi_notes(result["midi_path"])
+            self.assertAlmostEqual(tempo or 0, 120, places=1)
+            bar_ms = 4 * 60_000 / 120
+            drum_bars = Counter(
+                int(note["start_ms"] // bar_ms) for note in notes if note["midi"] in (36, 42)
+            )
+            # intro: hats only (four per bar, on the offbeat sixteenths)
+            self.assertEqual(drum_bars[0], 4)
+            # drop: the same hats plus a kick on every beat
+            self.assertEqual(drum_bars[1], 8)
+            self.assertEqual(drum_bars[2], 8)
+            # kick and hat are General-MIDI kit pieces, so the file opens as a kit
+            self.assertIn(36, [note["midi"] for note in notes])
+            self.assertIn(42, [note["midi"] for note in notes])
+            # the bass only plays from the drop, one note per bar
+            self.assertEqual(sum(1 for note in notes if note["midi"] == 33), 2)
+            self.assertTrue(all(note["start_ms"] >= bar_ms - 1 for note in notes if note["midi"] == 33))
 
     def test_render_part_reports_bars_and_duration(self):
         with tempfile.TemporaryDirectory() as tmp:

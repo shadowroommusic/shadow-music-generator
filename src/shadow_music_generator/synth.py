@@ -304,9 +304,123 @@ DRUM_VOICES = {
     "openhat": lambda rate, rng: _hat(rate, rng, open_hat=True),
 }
 
+#: General-MIDI pitches for those voices: what a rendered beat looks like as notes.
+DRUM_MIDI = {"kick": 36, "snare": 38, "clap": 39, "hat": 42, "openhat": 46}
+
+
+def _stretch_notes(spec: dict, bars: float) -> "list[dict]":
+    """What one stretch of a part plays, in beats from the stretch's own start.
+
+    This is the note view of the same spec the renderer plays, repeats included — drums tile their
+    step rows, pitched parts tile their written notes only when `repeat` asks for it.
+    """
+    if float(spec.get("gain", 1.0)) <= 0 or spec.get("silent"):
+        return []
+    out: "list[dict]" = []
+    if str(spec.get("part", "")) == "drums":
+        steps = int(spec.get("steps", 16))
+        total_steps = int(round(bars * steps))
+        # Swing is part of the plan (it is applied to the audio too); humanize is not, because it is
+        # random per hit and belongs to the performance rather than to the notation.
+        swing = float(spec.get("swing", 0.0))
+        for voice, row in (spec.get("pattern") or {}).items():
+            pitch = DRUM_MIDI.get(voice)
+            if pitch is None or not isinstance(row, str):
+                continue
+            block = row.replace("|", "").replace(" ", "")
+            if block == "":
+                continue
+            for repeat in range(0, max(1, -(-total_steps // len(block)))):
+                for index, symbol in enumerate(block):
+                    if symbol not in "xXoO":
+                        continue
+                    step = repeat * len(block) + index
+                    if step >= total_steps:
+                        continue
+                    out.append(
+                        {
+                            "midi": pitch,
+                            "start_beats": (step + (swing if step % 4 == 2 else 0.0)) * 4.0 / steps,
+                            "length_beats": 4.0 / steps / 2,
+                            "velocity": 112 if symbol in "xX" else 96,
+                        }
+                    )
+        return out
+
+    written = spec.get("notes") or []
+    if not written:
+        return []
+    written_end = max(float(note.get("start", 0)) + float(note.get("length", 1)) for note in written)
+    block_beats = max(4.0, 4.0 * math.ceil(written_end / 4.0))
+    repeat = spec.get("repeat")
+    copies = 1
+    if repeat:
+        wanted = int(repeat) if isinstance(repeat, (int, float)) and not isinstance(repeat, bool) else 0
+        copies = wanted if wanted > 0 else max(1, int(math.ceil(bars * 4.0 / block_beats)))
+    limit = bars * 4.0
+    for copy in range(copies):
+        for note in written:
+            start = float(note.get("start", 0)) + copy * block_beats
+            if start >= limit:
+                continue
+            out.append(
+                {
+                    "midi": int(note.get("midi", 60)),
+                    "start_beats": start,
+                    "length_beats": float(note.get("length", 1)),
+                    "velocity": int(note.get("velocity", 100)),
+                }
+            )
+    return out
+
+
+def song_midi_parts(spec: dict, bpm: float, bars: float) -> "list[dict]":
+    """The whole song as MIDI parts: every part, every segment, placed on the grid in milliseconds.
+
+    The renderer and this share one reading of the spec, so the MIDI that comes out of
+    `render_song(midi_path=…)` is the arrangement that was rendered — drums on MIDI's drum channel
+    (10), pitched parts as written.
+    """
+    parts: "list[dict]" = []
+    for index, part in enumerate(spec.get("parts") or []):
+        name = str(part.get("part", f"part{index + 1}"))
+        stretches: "list[tuple[float, dict, float]]" = []
+        segments = part.get("segments")
+        if isinstance(segments, list) and segments:
+            start = 0.0
+            for segment in segments:
+                if not isinstance(segment, dict):
+                    continue
+                length = float(segment.get("bars", 1))
+                stretches.append((start, {**part, **segment}, length))
+                start += length
+        else:
+            stretches.append((0.0, part, bars))
+        notes: "list[dict]" = []
+        for start_bar, stretch, length in stretches:
+            for note in _stretch_notes(stretch, length):
+                begin = (start_bar * 4.0 + note["start_beats"]) * 60_000.0 / bpm
+                notes.append(
+                    {
+                        "midi": note["midi"],
+                        "start_ms": begin,
+                        "end_ms": begin + note["length_beats"] * 60_000.0 / bpm,
+                        "velocity": note.get("velocity", 100),
+                    }
+                )
+        notes.sort(key=lambda entry: entry["start_ms"])
+        parts.append({"name": name, "channel": 9 if name == "drums" else 0, "notes": notes})
+    return parts
+
 
 def _render_drums(spec: dict, beats: float, rate: int, rng: np.random.Generator) -> np.ndarray:
-    """One bar of a step pattern, tiled across the part's bars."""
+    """A block of step rows, tiled across the part's bars.
+
+    One 16-step row is one bar, a 32-step row is two, so the row's own length decides the block and
+    the block repeats until the part is full. Without the repeat a 4-bar beat was one bar of audio
+    followed by three bars of silence — measured on the stems the workbench had already rendered
+    (`night-drive-drums.wav`: bar 1 = 0.108 RMS, bars 2–8 = 0.000).
+    """
     pattern = spec.get("pattern") or {}
     steps = int(spec.get("steps", 16))
     bars = int(spec.get("bars", 1))
@@ -315,27 +429,37 @@ def _render_drums(spec: dict, beats: float, rate: int, rng: np.random.Generator)
     swing = float(spec.get("swing", 0.0))
     humanize = float(spec.get("humanize_ms", 0.0)) / 1000 * rate
     total = int(round(beat_samples * beats))
+    total_steps = int(round(beats * (steps / 4)))
     out = np.zeros(total)
     for voice, row in pattern.items():
         factory = DRUM_VOICES.get(voice)
         if factory is None or not isinstance(row, str):
             continue
         hit = factory(rate, rng) * float(spec.get("gain", 1.0))
-        for index, symbol in enumerate(row.replace("|", "")):
-            if symbol not in "xXoO":
-                continue
-            step = index % steps
-            jitter = rng.uniform(-humanize, humanize) if humanize > 0 else 0.0
-            position = int(round(step * step_samples + _swing_offset(step, swing, step_samples) + jitter))
-            position = max(0, position)
-            length = min(hit.size, total - position)
-            if length > 0:
-                out[position : position + length] += hit[:length]
+        block = row.replace("|", "").replace(" ", "")
+        if block == "":
+            continue
+        for repeat in range(0, max(1, -(-total_steps // len(block)))):
+            for index, symbol in enumerate(block):
+                if symbol not in "xXoO":
+                    continue
+                step = repeat * len(block) + index
+                jitter = rng.uniform(-humanize, humanize) if humanize > 0 else 0.0
+                position = int(round(step * step_samples + _swing_offset(step, swing, step_samples) + jitter))
+                position = max(0, position)
+                length = min(hit.size, total - position)
+                if length > 0:
+                    out[position : position + length] += hit[:length]
     return out
 
 
 def _render_notes(spec: dict, beats: float, rate: int) -> np.ndarray:
-    """Pitched part: notes with midi number, start (beats) and length (beats)."""
+    """Pitched part: notes with midi number, start (beats) and length (beats).
+
+    `repeat` tiles the written notes: `true` repeats them until the part is full, a number repeats
+    them that many times. One bar of bass then covers an eight-bar part without the writer (or the
+    model) spelling the same notes out eight times.
+    """
     notes = spec.get("notes") or []
     beat_samples = rate * _seconds_per_beat(spec.get("bpm", 120))
     total = int(round(beat_samples * beats))
@@ -346,23 +470,52 @@ def _render_notes(spec: dict, beats: float, rate: int) -> np.ndarray:
     release = float(spec.get("release", 0.08))
     gain = float(spec.get("gain", 0.7))
     vibrato = float(spec.get("vibrato", 0.0))
-    for note in notes:
-        midi = float(note.get("midi", 60))
-        start = int(round(float(note.get("start", 0)) * beat_samples))
-        length = int(round(float(note.get("length", 1)) * beat_samples))
-        length = max(1, min(length, total - start))
-        if length <= 1 or start >= total:
-            continue
-        time = np.arange(length) / rate
-        frequency = np.full(length, midi_to_hz(midi))
-        if vibrato > 0:
-            frequency = frequency * (1 + vibrato * np.sin(2 * np.pi * 5.0 * time))
-        voice = _oscillator(wave_kind, frequency)
-        if wave_kind == "saw" and cutoff < 1.0:
-            voice = _lowpass(voice, cutoff)
-        envelope = _envelope(length, rate, attack, 0.05, 0.8, release)
-        out[start : start + length] += voice * envelope * gain * float(note.get("gain", 1.0))
+    block_beats = 4.0
+    if notes:
+        written = max(float(note.get("start", 0)) + float(note.get("length", 1)) for note in notes)
+        block_beats = max(4.0, 4.0 * math.ceil(written / 4.0))
+    repeat = spec.get("repeat")
+    copies = 1
+    if repeat and notes:
+        wanted = int(repeat) if isinstance(repeat, (int, float)) and not isinstance(repeat, bool) else 0
+        copies = wanted if wanted > 0 else max(1, int(math.ceil(beats / block_beats)))
+    for copy in range(copies):
+        offset = copy * block_beats
+        for note in notes:
+            _place_note(out, note, offset, beat_samples, total, wave_kind, cutoff, attack, release, gain, vibrato, rate)
     return out
+
+
+def _place_note(
+    out: np.ndarray,
+    note: dict,
+    offset_beats: float,
+    beat_samples: float,
+    total: int,
+    wave_kind: str,
+    cutoff: float,
+    attack: float,
+    release: float,
+    gain: float,
+    vibrato: float,
+    rate: int,
+) -> None:
+    """Add one note (shifted by `offset_beats`) to a pitched part's buffer."""
+    midi = float(note.get("midi", 60))
+    start = int(round((float(note.get("start", 0)) + offset_beats) * beat_samples))
+    length = int(round(float(note.get("length", 1)) * beat_samples))
+    length = max(1, min(length, total - start))
+    if length <= 1 or start >= total:
+        return
+    time = np.arange(length) / rate
+    frequency = np.full(length, midi_to_hz(midi))
+    if vibrato > 0:
+        frequency = frequency * (1 + vibrato * np.sin(2 * np.pi * 5.0 * time))
+    voice = _oscillator(wave_kind, frequency)
+    if wave_kind == "saw" and cutoff < 1.0:
+        voice = _lowpass(voice, cutoff)
+    envelope = _envelope(length, rate, attack, 0.05, 0.8, release)
+    out[start : start + length] += voice * envelope * gain * float(note.get("gain", 1.0))
 
 
 def renders_part(spec: dict, rate: int = SAMPLE_RATE) -> np.ndarray:
@@ -434,6 +587,12 @@ def render_song(spec: dict) -> dict:
 
     `parts` entries carry `part`, the pattern/notes, an optional `gain` and an optional `out_path`
     (defaults to a sibling of the mix, suffixed with the part name).
+
+    An arrangement is a part made of `segments`: each segment is a stretch of bars rendered with the
+    part's settings as defaults and the segment's keys overriding them, and the stretches are
+    concatenated — so an intro can be hats only, the drop can add kick and clap, and a breakdown can
+    be `{"bars": 8, "gain": 0}` (silence). `sections` names the timeline (`intro` / `drop` / …) and
+    sets the total length when `bars` is not given.
     """
     out_path = spec.get("out_path")
     if not out_path:
@@ -441,17 +600,22 @@ def render_song(spec: dict) -> dict:
     song = Path(out_path).expanduser()
     song.parent.mkdir(parents=True, exist_ok=True)
     bpm = float(spec.get("bpm", 120))
-    bars = float(spec.get("bars", 4))
+    sections = _describe_sections(spec.get("sections") or [])
+    bars = float(spec.get("bars") or (sum(entry["bars"] for entry in sections) if sections else 4))
     parts = spec.get("parts") or []
     if not parts:
         raise ValueError("render_song needs at least one part")
+    total_samples = int(round(bars * 4 * _seconds_per_beat(bpm) * SAMPLE_RATE))
 
     rendered: "list[dict]" = []
     mix: np.ndarray | None = None
     for index, part in enumerate(parts):
         kind = str(part.get("part", f"part{index + 1}"))
-        payload = {**part, "bpm": bpm, "bars": bars, "seed": part.get("seed", 7 + index)}
-        samples = _normalise(renders_part(payload), peak=0.85)
+        samples, segments = _render_part_arrangement(part, bpm, bars, index)
+        # Every part is exactly the song long: a part that only enters later is padded, so the mix
+        # and the stems line up with the timeline the sections describe.
+        samples = _fit(samples, total_samples)
+        samples = _normalise(samples, peak=0.85)
         target = Path(part["out_path"]).expanduser() if part.get("out_path") else song.with_name(f"{song.stem}-{kind}.wav")
         write_audio(target, samples, SAMPLE_RATE)
         rendered.append(
@@ -459,8 +623,10 @@ def render_song(spec: dict) -> dict:
                 "part": kind,
                 "path": str(target),
                 "duration_ms": _duration_ms(samples.shape[0], SAMPLE_RATE),
+                "bars": bars,
                 "gain": float(part.get("gain", 1.0)),
                 "pan": float(part.get("pan", 0.0)),
+                "segments": segments,
             }
         )
         contribution = samples * float(part.get("gain", 1.0))
@@ -470,19 +636,114 @@ def render_song(spec: dict) -> dict:
     mix = np.tanh(mix * 0.9)  # soft clip instead of hard clipping
     mix = _normalise(mix, peak=0.92)
     write_audio(song, mix, SAMPLE_RATE)
+    # The same arrangement as notes, when asked for: the MIDI is not transcribed from the audio, it
+    # is the plan that was played, so it lines up with the stems exactly.
+    midi_target: "Path | None" = None
+    if spec.get("midi_path"):
+        midi_target = write_midi_multitrack(
+            song_midi_parts(spec, bpm, bars),
+            str(spec["midi_path"]),
+            bpm=bpm,
+        )
     return {
         "schema_version": 1,
         "mode": "render-song",
         "path": str(song),
+        "midi_path": str(midi_target) if midi_target is not None else None,
         "bpm": bpm,
         "bars": bars,
         "duration_ms": _duration_ms(mix.shape[0], SAMPLE_RATE),
         "channels": 2,
         "sample_rate": SAMPLE_RATE,
         "parts": rendered,
+        "sections": sections,
         "notes": [note_name(int(note.get("midi", 60))) for part in parts for note in (part.get("notes") or [])][:64],
         "warnings": [],
     }
+
+
+def _describe_sections(sections: "list[dict]") -> "list[dict]":
+    """Name and place the song's sections: `[{name, bars, start_bar}]`, in timeline order."""
+    described: "list[dict]" = []
+    start = 0.0
+    for index, section in enumerate(sections):
+        if not isinstance(section, dict):
+            continue
+        length = float(section.get("bars", 0))
+        described.append(
+            {
+                "name": str(section.get("name") or f"section {index + 1}"),
+                "bars": length,
+                "start_bar": start,
+            }
+        )
+        start += length
+    return described
+
+
+def _fit(signal: np.ndarray, size: int) -> np.ndarray:
+    """Trim or pad a rendered part so it is exactly `size` frames long."""
+    frames = _as_frames(signal)
+    if frames.shape[0] == size:
+        return frames
+    if frames.shape[0] > size:
+        return frames[:size]
+    return _pad_to(frames, size)
+
+
+def _render_part_arrangement(
+    part: dict,
+    bpm: float,
+    bars: float,
+    index: int,
+) -> "tuple[np.ndarray, list[dict]]":
+    """Render one part of the song: a plain loop, or the chain of segments an arrangement is made of.
+
+    A part without `segments` keeps the old behaviour exactly — one block of `bars`. With `segments`,
+    each entry is rendered on its own and they are concatenated, which is what turns "a loop" into
+    "a song": the same part plays different things per section, and `gain: 0` (or `silent: true`)
+    leaves a stretch empty.
+    """
+    segments = part.get("segments")
+    if not isinstance(segments, list) or len(segments) == 0:
+        payload = {**part, "bpm": bpm, "bars": bars, "seed": part.get("seed", 7 + index)}
+        return renders_part(payload), []
+
+    blocks: "list[np.ndarray]" = []
+    described: "list[dict]" = []
+    start = 0.0
+    for position, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            continue
+        length = float(segment.get("bars", 1))
+        silent = bool(segment.get("silent")) or float(segment.get("gain", part.get("gain", 1.0))) == 0.0
+        frames = int(round(length * 4 * _seconds_per_beat(bpm) * SAMPLE_RATE))
+        if silent:
+            blocks.append(np.zeros((max(0, frames), 2), dtype=np.float32))
+        else:
+            payload = {
+                **part,
+                **segment,
+                "bpm": bpm,
+                "bars": length,
+                "seed": segment.get("seed", part.get("seed", 7 + index)) + position,
+            }
+            payload.pop("segments", None)
+            blocks.append(renders_part(payload))
+        described.append(
+            {
+                "bars": length,
+                "start_bar": start,
+                "silent": silent,
+                "part": str(segment.get("part", part.get("part", ""))),
+            }
+        )
+        start += length
+    if not blocks:
+        payload = {**part, "bpm": bpm, "bars": bars, "seed": part.get("seed", 7 + index)}
+        payload.pop("segments", None)
+        return renders_part(payload), []
+    return np.concatenate(blocks, axis=0), described
 
 
 def _pad_to(signal: np.ndarray, size: int) -> np.ndarray:
@@ -648,7 +909,9 @@ def _vlq(value: int) -> bytes:
 def write_midi_multitrack(parts: "list[dict]", path: "str | Path", *, bpm: float = 120.0) -> Path:
     """Write a Type-1 MIDI file: one track per part, notes in milliseconds.
 
-    `parts` entries are `{"name": str, "notes": [{"midi", "start_ms", "end_ms", "velocity"?}]}`.
+    `parts` entries are `{"name": str, "channel"?: int, "notes": [{"midi", "start_ms", "end_ms",
+    "velocity"?}]}`. A channel of 9 (the tenth) is MIDI's drum channel, which is where a rendered
+    drum part belongs so the file opens as a kit instead of a piano.
     """
     ticks_per_beat = 480
     target = Path(path).expanduser()
@@ -668,13 +931,14 @@ def write_midi_multitrack(parts: "list[dict]", path: "str | Path", *, bpm: float
 
     for part in parts:
         events: "list[tuple[int, int, bytes]]" = []
+        channel = max(0, min(15, int(part.get("channel", 0))))
         for order, note in enumerate(part.get("notes") or []):
             midi = max(0, min(127, int(note.get("midi", 60))))
             velocity = max(1, min(127, int(note.get("velocity", 100))))
             start = to_ticks(float(note.get("start_ms", 0)))
             end = max(start + 1, to_ticks(float(note.get("end_ms", 0))))
-            events.append((start, 1, bytes([0x90, midi, velocity])))
-            events.append((end, 0, bytes([0x80, midi, 64])))
+            events.append((start, 1, bytes([0x90 | channel, midi, velocity])))
+            events.append((end, 0, bytes([0x80 | channel, midi, 64])))
         events.sort(key=lambda item: (item[0], item[1]))
         track = bytearray()
         name = str(part.get("name") or "part").encode("utf-8")[:127]

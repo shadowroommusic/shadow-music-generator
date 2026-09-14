@@ -14,6 +14,9 @@
 - **带历史的任务队列**：每个任务都是一个 JSON 文件，含状态、流水线阶段、耗时、产物与错误。
 - **自带流水线**：本地执行通过 `SHADOW_PIPELINE_FACTORY` 指向的适配器完成，插件只负责按顺序调用。
 - **许可证透明**：每个任务结果都会记录模型许可证；插件不下载、不打包任何权重。
+- **可以直接编曲的本地合成器**：`render_song` 用一份很小的 JSON 计划写出混音与每个声部一条分轨 ——
+  步进 pattern 与音符、段落（intro / drop …）、按段落的 segments；需要时把同一份编曲再写成 Type-1 MIDI
+  （按计划记谱，而不是从音频里猜）。
 
 ## 当前定位
 
@@ -74,8 +77,23 @@ MCP 客户端配置：
 | `submit_generation` | 排入一个任务（`prompt`、`mode`、`model`、`lyrics`、`source_audio`、`output_dir`、`job_dir`、`run`） |
 | `run_job` | 执行已排队任务，可用 `factory` 临时覆盖适配器 |
 | `job_status` | 读取某个任务的状态、阶段、产物与错误 |
+| `render_part` | 用本地合成器把一个声部（drums / bass / chords / lead / pad）渲染成 WAV |
+| `render_song` | 渲染整首编曲：混音 + 每个声部一条分轨，可选同时写出 MIDI（`midi_path`） |
+| `mix_arrangement` | 把工程里的片段混成一个文件（WAV/AIFF，44.1/48/96 kHz，16/24-bit） |
+| `export_stems` | 把工程的每条轨道各导出一个文件（分轨） |
+| `export_midi` | 把带音符的片段（或指向 `.mid` 的片段）写成 Type-1 MIDI |
 
 命令行等价：`shadow-music-generator submit`、`run`、`status`、`list`。
+
+### 本地合成器
+
+`render_song` 负责把"32 小节 tech house：intro 8、drop 16、outro 8"这样一句话变成音频，计划本身刻意
+保持很小：`sections` 给歌曲分段，每个 `part` 用 `segments` 按同样的顺序分段 —— 每一段以这个声部的设置
+为默认、用自己给的键覆盖，然后首尾相接；`{"bars":8,"gain":0}`（或 `silent: true`）表示这一段空着，
+breakdown 里鼓就是这么消失的。鼓的 16 步一行 = 一小节，会自动铺满整个声部（32 步 = 两小节一块）；
+写成的音符只有 `repeat` 时才重复。带上 `midi_path` 时，同一份编曲会额外写成 MIDI（每个声部一轨、鼓在
+MIDI 第 10 通道，swing 也写进去，因为 swing 属于计划而不是演奏）。每条分轨都和整首一样长，所以分轨、
+混音、MIDI 完全对齐。
 
 ## 用法
 

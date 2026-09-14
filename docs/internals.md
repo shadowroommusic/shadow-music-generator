@@ -100,10 +100,36 @@ normalises audio; a failure is reported per stage and keeps the earlier stages i
 Identical hashes mean the queue added nothing to the audio; a difference points at the command
 (GPU, runtime version, sampling settings) rather than at this plugin.
 
+## The local synth (`synth.py`)
+
+`render_part` / `render_song` / `mix_arrangement` / `export_stems` / `export_midi` are the second
+half of this plugin: the queue records what to generate, the synth generates. Everything is numpy —
+`_oscillator`, `_lowpass`, `_envelope`, `_kick` / `_snare` / `_clap` / `_hat` — so the plugin keeps
+its "no ML dependency" property. Parts are rendered mono, panned (equal power), delayed and reverbed
+per channel, and written as stereo WAV (16/24-bit) or AIFF.
+
+Three things about the arrangement model are worth keeping in mind when editing it:
+
+1. **A part is a chain of segments.** `_render_part_arrangement` renders each `segments` entry with
+   the part's settings as defaults and the entry's keys on top, then concatenates; `{"gain": 0}` or
+   `silent: true` renders silence. `_fit` then makes every part exactly the song's length, which is
+   what keeps the stems, the mix and the MIDI on one timeline. A part without `segments` renders one
+   block of `bars` — the loop case, byte for byte what it always was.
+2. **Drums tile; notes repeat only when asked.** `_render_drums` repeats a step row across the part
+   (a 16-step row is one bar, a 32-step row is a two-bar block). This was a real bug until
+   2026-09-15: rows were placed once, so a 4-bar beat was one bar of audio followed by three bars of
+   silence — measured on the workbench's own stems (`night-drive-drums.wav`, 8 bars: bar 1 = 0.108
+   RMS, bars 2–8 = 0.000). Pitched parts keep the written positions unless `repeat` says otherwise.
+3. **The MIDI is the plan, not a transcription.** `song_midi_parts` reads the same spec through
+   `_stretch_notes` — segments, repeats, sections — and writes it with `write_midi_multitrack`, drums
+   on channel 10 (index 9). Swing is applied (it is part of the plan); `humanize_ms` is not, because
+   it is random per hit and belongs to the performance.
+
 ## Tests
 
 The suite builds its own adapter modules in a temp directory, so it exercises the real import path,
-stage sequence and failure reporting without any model weights:
+stage sequence and failure reporting without any model weights; the synth tests render into temp
+directories and read the files back (levels per bar, sections, the MIDI the render hands out).
 
 ```sh
 PYTHONPATH=src python3 -m unittest discover -s tests -v

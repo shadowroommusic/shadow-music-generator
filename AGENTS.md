@@ -77,3 +77,18 @@ it), and together they are the toolkit that `producer-tools` bundles into one ap
   "shadowroom-automation (Codex)"). 2FA is enabled on the account.
 - The Codex plugin marketplace named `shadowroom` currently points at an older monorepo checkout;
   the repositories above are the source of truth.
+
+- **2026-09-15 — the synth arranges: sections, segments, and MIDI from the plan.** `render_song`
+  takes `sections` (`intro` / `drop` / …) that name the timeline and set the length, and every part
+  can be a chain of `segments` — each one a stretch of bars with its own pattern/notes/gain, so a
+  breakdown is `{"bars": 8, "gain": 0}`. Every part is fitted to the song's length, so stems, mix and
+  MIDI line up. `midi_path` writes the arrangement as a Type-1 MIDI file (drums on channel 10, swing
+  included, humanised timing not) — not a transcription. Verified end to end through the workbench:
+  "a 12-bar deep house, intro 4 / drop 6 / outro 2, and its MIDI too" → stems + mix with intro 0.098
+  / drop 0.252 / outro 0.105 RMS and a 148-note MIDI at the song's tempo.
+
+- **2026-09-15 — drum rows tile, and that was a real bug.** `_render_drums` placed a step row once, so
+  every drum part longer than one bar was one bar of audio followed by silence — measured on the
+  stems the workbench had already rendered (`night-drive-drums.wav`: bar 1 = 0.108 RMS, bars 2–8 =
+  0.000). Rows now repeat across the part (16 steps = one bar, 32 = a two-bar block), and pitched
+  parts gained `repeat` for the same reason: a written bar can cover an eight-bar part.
