@@ -49,10 +49,41 @@ SKETCH = {
 
 
 def read(path: str) -> "tuple[np.ndarray, int]":
+    """Mono view of a file (stems are stereo now; level checks do not care)."""
     with wave.open(path, "rb") as handle:
         rate = handle.getframerate()
+        channels = handle.getnchannels()
         frames = handle.readframes(handle.getnframes())
-    return np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0, rate
+    data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    return (data.reshape(-1, channels).mean(axis=1) if channels > 1 else data), rate
+
+
+def _onset_ms(samples: "np.ndarray", rate: int, window_ms: int = 10) -> "list[int]":
+    """Tiny RMS-flux onset finder, so the swing test does not depend on another repo."""
+    step = int(rate * window_ms / 1000)
+    count = samples.size // step
+    energy = np.sqrt(np.mean(samples[: count * step].reshape(count, step) ** 2, axis=1))
+    flux = np.maximum(np.diff(energy, prepend=energy[:1]), 0.0)
+    gate = 0.25 * float(flux.max() or 0.0)
+    hits: "list[int]" = []
+    last = -10
+    for index in range(1, count - 1):
+        if flux[index] < gate or flux[index] < flux[index - 1] or flux[index] < flux[index + 1]:
+            continue
+        if index - last < 3:
+            continue
+        hits.append(int(round(index * window_ms)))
+        last = index
+    return hits
+
+
+def read_stereo(path: str) -> "tuple[np.ndarray, int]":
+    with wave.open(path, "rb") as handle:
+        rate = handle.getframerate()
+        channels = handle.getnchannels()
+        frames = handle.readframes(handle.getnframes())
+    data = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+    return data.reshape(-1, channels), rate
 
 
 class SynthTests(unittest.TestCase):
@@ -212,6 +243,89 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(struct.unpack(">HHH", data[8:14]), (1, 2, 480))  # type 1, tempo + 1 part
             _notes, tempo = read_midi_notes(target)
             self.assertAlmostEqual(tempo or 0, 124.0, places=1)
+
+
+class SpatialTests(unittest.TestCase):
+    """Pan, reverb, delay, swing and humanize — the difference between a demo and a mix."""
+
+    def test_pan_places_a_part_in_the_image(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            left = render_part(
+                {"out_path": str(Path(tmp) / "left.wav"), "part": "bass", "bpm": 120, "bars": 1,
+                 "wave": "sine", "pan": -1.0, "reverb": 0.0,
+                 "notes": [{"midi": 40, "start": 0, "length": 2}]}
+            )
+            right = render_part(
+                {"out_path": str(Path(tmp) / "right.wav"), "part": "bass", "bpm": 120, "bars": 1,
+                 "wave": "sine", "pan": 1.0, "reverb": 0.0,
+                 "notes": [{"midi": 40, "start": 0, "length": 2}]}
+            )
+            left_frames, _ = read_stereo(left["path"])
+            right_frames, _ = read_stereo(right["path"])
+            self.assertGreater(float(np.abs(left_frames[:, 0]).mean()), 10 * float(np.abs(left_frames[:, 1]).mean()))
+            self.assertGreater(float(np.abs(right_frames[:, 1]).mean()), 10 * float(np.abs(right_frames[:, 0]).mean()))
+            self.assertEqual(left["channels"], 2)
+
+    def test_reverb_adds_a_tail_after_the_last_note(self):
+        spec = {
+            "part": "chords",
+            "bpm": 120,
+            "bars": 1,
+            "wave": "triangle",
+            "notes": [{"midi": 60, "start": 0, "length": 1}],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            dry = render_part({"out_path": str(Path(tmp) / "dry.wav"), **spec, "reverb": 0.0})
+            wet = render_part({"out_path": str(Path(tmp) / "wet.wav"), **spec, "reverb": 0.5, "reverb_decay": 1.4})
+            dry_frames, rate = read_stereo(dry["path"])
+            wet_frames, _ = read_stereo(wet["path"])
+            # the note lasts 0.5 s; look at the 0.8 s after it, where only reverb can be
+            window = slice(int(0.6 * rate), int(1.3 * rate))
+            dry_tail = float(np.sqrt(np.mean(dry_frames[window] ** 2)))
+            wet_tail = float(np.sqrt(np.mean(wet_frames[window] ** 2)))
+            self.assertLess(dry_tail, 1e-4)
+            self.assertGreater(wet_tail, 20 * max(dry_tail, 1e-6))
+
+    def test_swing_delays_the_offbeats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            straight = render_part(
+                {"out_path": str(Path(tmp) / "straight.wav"), "part": "drums", "bpm": 120, "bars": 1,
+                 "pattern": {"hat": "..x...x...x...x."}, "swing": 0.0, "reverb": 0.0}
+            )
+            swung = render_part(
+                {"out_path": str(Path(tmp) / "swung.wav"), "part": "drums", "bpm": 120, "bars": 1,
+                 "pattern": {"hat": "..x...x...x...x."}, "swing": 0.5, "reverb": 0.0}
+            )
+            straight_samples, rate = read(straight["path"])
+            swung_samples, _ = read(swung["path"])
+            straight_hits = _onset_ms(straight_samples, rate)
+            swung_hits = _onset_ms(swung_samples, rate)
+            self.assertEqual(len(straight_hits), len(swung_hits))
+            # hat hits sit on the offbeats (steps 2, 6, 10, 14 → 250/750/1250/1750 ms at 120 BPM)
+            self.assertAlmostEqual(straight_hits[0], 250, delta=25)
+            # …and swing pushes exactly those offbeats later
+            self.assertGreater(swung_hits[0], straight_hits[0] + 30)
+
+    def test_song_mix_is_stereo_and_decorrelated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            song = render_song(
+                {
+                    "out_path": str(Path(tmp) / "wide.wav"),
+                    "bpm": 124,
+                    "bars": 2,
+                    "parts": [
+                        {"part": "drums", "pan": -0.2, "reverb": 0.2,
+                         "pattern": {"kick": "x...x...x...x...", "hat": "..x...x...x...x."}},
+                        {"part": "bass", "pan": 0.15, "wave": "saw", "cutoff": 0.35,
+                         "notes": [{"midi": 36, "start": 0, "length": 1}]},
+                    ],
+                }
+            )
+            frames, _ = read_stereo(song["path"])
+            self.assertEqual(frames.shape[1], 2)
+            correlation = float(np.corrcoef(frames[:, 0], frames[:, 1])[0, 1])
+            self.assertLess(correlation, 0.999)
+            self.assertGreater(float(np.abs(frames).max()), 0.3)
 
 
 if __name__ == "__main__":

@@ -32,6 +32,67 @@ SAMPLE_RATE = 44_100
 NOTE_NAMES = ("C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B")
 
 
+def _as_frames(samples: np.ndarray) -> np.ndarray:
+    """Audio as (frames, channels); 1-D input counts as mono."""
+    return samples if samples.ndim == 2 else samples[:, None]
+
+
+def _fft_convolve(signal: np.ndarray, impulse: np.ndarray) -> np.ndarray:
+    """Convolve one channel with an impulse response through the FFT (no scipy needed)."""
+    size = signal.size + impulse.size - 1
+    spectrum = np.fft.rfft(signal, size) * np.fft.rfft(impulse, size)
+    return np.fft.irfft(spectrum, size)
+
+
+def _reverb(signal: np.ndarray, rate: int, amount: float = 0.22, decay_s: float = 0.9, seed: int = 11) -> np.ndarray:
+    """Small-room reverb: a decaying noise impulse per channel, decorrelated so it widens the image."""
+    if amount <= 0:
+        return signal
+    frames = _as_frames(signal).astype(np.float32)
+    rng = np.random.default_rng(seed)
+    tail = int(decay_s * rate)
+    time = np.arange(tail) / rate
+    out = np.empty_like(frames)
+    for channel in range(frames.shape[1]):
+        impulse = rng.standard_normal(tail) * np.exp(-time / (decay_s / 4.2))
+        impulse[: int(0.012 * rate)] = 0.0  # pre-delay keeps transients tight
+        impulse /= float(np.sqrt(np.sum(impulse**2))) + 1e-9
+        wet = _fft_convolve(frames[:, channel], impulse)[: frames.shape[0]]
+        out[:, channel] = (1.0 - amount) * frames[:, channel] + amount * wet * float(np.std(frames[:, channel]) or 1.0)
+    return out
+
+
+def _delay(signal: np.ndarray, rate: int, time_ms: float = 375.0, feedback: float = 0.28, mix: float = 0.18) -> np.ndarray:
+    """Two-tap delay with feedback, dotted-eighth by default."""
+    if mix <= 0:
+        return signal
+    frames = _as_frames(signal).astype(np.float32)
+    delay = int(rate * time_ms / 1000)
+    if delay <= 0:
+        return frames
+    out = frames.copy()
+    tap = np.zeros_like(frames)
+    tap[delay:] = frames[:-delay]
+    out += tap * mix
+    tap2 = np.zeros_like(frames)
+    tap2[2 * delay :] = frames[: -2 * delay] if frames.shape[0] > 2 * delay else 0
+    out += tap2 * mix * feedback
+    return out
+
+
+def _pan(mono: np.ndarray, position: float) -> np.ndarray:
+    """Equal-power pan: -1 hard left, 0 centre, +1 hard right."""
+    angle = (float(np.clip(position, -1.0, 1.0)) + 1.0) * np.pi / 4.0
+    return np.stack([mono * math.cos(angle), mono * math.sin(angle)], axis=1)
+
+
+def _swing_offset(step: int, swing: float, step_samples: float) -> float:
+    """Swing pushes the offbeat eighths (grid steps 2, 6, 10, …) later."""
+    if swing <= 0 or step % 4 != 2:
+        return 0.0
+    return float(swing) * step_samples
+
+
 def midi_to_hz(midi: float) -> float:
     return 440.0 * 2 ** ((midi - 69) / 12)
 
@@ -62,41 +123,42 @@ def write_audio(
     bit_depth: int = 16,
     container: str = "wav",
 ) -> Path:
-    """Write mono audio as WAV (16/24-bit) or AIFF (16-bit).
+    """Write audio as WAV (16/24-bit) or AIFF (16-bit); 1-D input is mono, 2-D is interleaved.
 
     Anything lossy (MP3/AAC) needs an encoder binary, which this project deliberately does not depend
     on — the export UI says so instead of pretending.
     """
     target = Path(path).expanduser()
     target.parent.mkdir(parents=True, exist_ok=True)
-    clipped = np.clip(samples, -1.0, 1.0)
+    frames = _as_frames(samples)
+    clipped = np.clip(frames, -1.0, 1.0)
+    channels = clipped.shape[1]
     if container == "aiff":
-        frames = (clipped * 32767.0).astype(">i2").tobytes()
+        payload = (clipped * 32767.0).astype(">i2").tobytes()
         # 80-bit IEEE-754 extended sample rate, the one awkward part of the AIFF header
         exponent = 16398
         mantissa = int(rate) << 48
         header = (
             b"FORM"
-            + struct.pack(">I", 4 + 8 + 18 + 8 + len(frames))
+            + struct.pack(">I", 4 + 8 + 18 + 8 + len(payload))
             + b"AIFF"
             + b"COMM"
             + struct.pack(">I", 18)
-            + struct.pack(">hIh", 1, len(frames) // 2, 16)
+            + struct.pack(">hIh", channels, clipped.shape[0], 16)
             + struct.pack(">HQ", exponent, mantissa)
             + b"SSND"
-            + struct.pack(">I", len(frames) + 8)
+            + struct.pack(">I", len(payload) + 8)
             + struct.pack(">II", 0, 0)
         )
-        target.write_bytes(header + frames)
+        target.write_bytes(header + payload)
         return target
     with wave.open(str(target), "wb") as handle:
-        handle.setnchannels(1)
+        handle.setnchannels(channels)
         handle.setsampwidth(3 if bit_depth == 24 else 2)
         handle.setframerate(rate)
         if bit_depth == 24:
             scaled = (clipped * 8388607.0).astype("<i4")
-            packed = scaled.astype("<i4").tobytes()
-            packed = b"".join(packed[i : i + 3] for i in range(0, len(packed), 4))
+            packed = scaled.reshape(-1).view(np.uint8).reshape(-1, 4)[:, :3].tobytes()
             handle.writeframes(packed)
         else:
             handle.writeframes((clipped * 32767.0).astype("<i2").tobytes())
@@ -105,6 +167,11 @@ def write_audio(
 
 def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
     """Linear resample — plenty for a mixdown, and no scipy dependency."""
+    if samples.ndim == 2:
+        return np.stack(
+            [_resample(samples[:, channel], source_rate, target_rate) for channel in range(samples.shape[1])],
+            axis=1,
+        )
     if source_rate == target_rate or samples.size == 0:
         return samples
     count = int(round(samples.size * target_rate / source_rate))
@@ -114,8 +181,8 @@ def _resample(samples: np.ndarray, source_rate: int, target_rate: int) -> np.nda
     return np.interp(source_index, np.arange(samples.size), samples).astype(np.float32)
 
 
-def read_wav(path: "str | Path") -> "tuple[np.ndarray, int]":
-    """Read a PCM WAV as mono float samples."""
+def read_audio(path: "str | Path") -> "tuple[np.ndarray, int]":
+    """Read a PCM WAV as float frames: `(N,)` for mono, `(N, channels)` for interleaved."""
     with wave.open(str(Path(path).expanduser()), "rb") as handle:
         channels = handle.getnchannels()
         width = handle.getsampwidth()
@@ -133,8 +200,14 @@ def read_wav(path: "str | Path") -> "tuple[np.ndarray, int]":
     else:
         data = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
     if channels > 1:
-        data = data.reshape(-1, channels).mean(axis=1)
+        data = data.reshape(-1, channels)
     return data, rate
+
+
+def read_wav(path: "str | Path") -> "tuple[np.ndarray, int]":
+    """Read a PCM WAV folded to mono (melody/groove analysis wants one channel)."""
+    data, rate = read_audio(path)
+    return (data.mean(axis=1) if data.ndim == 2 else data), rate
 
 
 def _seconds_per_beat(bpm: float) -> float:
@@ -239,6 +312,8 @@ def _render_drums(spec: dict, beats: float, rate: int, rng: np.random.Generator)
     bars = int(spec.get("bars", 1))
     beat_samples = rate * _seconds_per_beat(spec.get("bpm", 120))
     step_samples = beat_samples / (steps / 4)  # 16 steps = one bar of 4 beats
+    swing = float(spec.get("swing", 0.0))
+    humanize = float(spec.get("humanize_ms", 0.0)) / 1000 * rate
     total = int(round(beat_samples * beats))
     out = np.zeros(total)
     for voice, row in pattern.items():
@@ -250,7 +325,9 @@ def _render_drums(spec: dict, beats: float, rate: int, rng: np.random.Generator)
             if symbol not in "xXoO":
                 continue
             step = index % steps
-            position = int(round(step * step_samples))
+            jitter = rng.uniform(-humanize, humanize) if humanize > 0 else 0.0
+            position = int(round(step * step_samples + _swing_offset(step, swing, step_samples) + jitter))
+            position = max(0, position)
             length = min(hit.size, total - position)
             if length > 0:
                 out[position : position + length] += hit[:length]
@@ -289,14 +366,34 @@ def _render_notes(spec: dict, beats: float, rate: int) -> np.ndarray:
 
 
 def renders_part(spec: dict, rate: int = SAMPLE_RATE) -> np.ndarray:
-    """Render one part (drums, bass, chords, lead, pad) to mono samples."""
+    """Render one part (drums, bass, chords, lead, pad) to a stereo buffer.
+
+    The voice is rendered mono, then placed with `pan`, touched by `delay` and `reverb`, so a part
+    arrives with its own position in the image instead of a dry centre line.
+    """
     bpm = float(spec.get("bpm", 120))
     beats = float(spec.get("beats") or spec.get("bars", 1) * 4)
     kind = str(spec.get("part", "bass"))
     rng = np.random.default_rng(int(spec.get("seed", 7)))
     if kind == "drums":
-        return _render_drums({**spec, "bpm": bpm, "bars": spec.get("bars", 1)}, beats, rate, rng)
-    return _render_notes({**spec, "bpm": bpm}, beats, rate)
+        mono = _render_drums({**spec, "bpm": bpm, "bars": spec.get("bars", 1)}, beats, rate, rng)
+    else:
+        mono = _render_notes({**spec, "bpm": bpm}, beats, rate)
+    stereo = _pan(mono, float(spec.get("pan", 0.0)))
+    stereo = _delay(
+        stereo,
+        rate,
+        time_ms=float(spec.get("delay_ms", 375.0)),
+        feedback=float(spec.get("delay_feedback", 0.28)),
+        mix=float(spec.get("delay", 0.0)),
+    )
+    return _reverb(
+        stereo,
+        rate,
+        amount=float(spec.get("reverb", 0.12)),
+        decay_s=float(spec.get("reverb_decay", 0.9)),
+        seed=int(spec.get("seed", 7)),
+    )
 
 
 def _normalise(signal: np.ndarray, peak: float = 0.89) -> np.ndarray:
@@ -316,7 +413,7 @@ def render_part(spec: dict) -> dict:
     if not out_path:
         raise ValueError("render_part needs an out_path")
     samples = _normalise(renders_part(spec))
-    target = write_wav(out_path, samples)
+    target = write_audio(out_path, samples, SAMPLE_RATE)
     beats = float(spec.get("beats") or spec.get("bars", 1) * 4)
     return {
         "schema_version": 1,
@@ -325,8 +422,10 @@ def render_part(spec: dict) -> dict:
         "path": str(target),
         "bpm": float(spec.get("bpm", 120)),
         "bars": beats / 4,
-        "duration_ms": _duration_ms(samples.size, SAMPLE_RATE),
+        "duration_ms": _duration_ms(samples.shape[0], SAMPLE_RATE),
         "sample_rate": SAMPLE_RATE,
+        "channels": 2,
+        "pan": float(spec.get("pan", 0.0)),
     }
 
 
@@ -354,29 +453,31 @@ def render_song(spec: dict) -> dict:
         payload = {**part, "bpm": bpm, "bars": bars, "seed": part.get("seed", 7 + index)}
         samples = _normalise(renders_part(payload), peak=0.85)
         target = Path(part["out_path"]).expanduser() if part.get("out_path") else song.with_name(f"{song.stem}-{kind}.wav")
-        write_wav(target, samples)
+        write_audio(target, samples, SAMPLE_RATE)
         rendered.append(
             {
                 "part": kind,
                 "path": str(target),
-                "duration_ms": _duration_ms(samples.size, SAMPLE_RATE),
+                "duration_ms": _duration_ms(samples.shape[0], SAMPLE_RATE),
                 "gain": float(part.get("gain", 1.0)),
+                "pan": float(part.get("pan", 0.0)),
             }
         )
         contribution = samples * float(part.get("gain", 1.0))
-        mix = contribution if mix is None else _pad_to(mix, contribution.size) + _pad_to(contribution, mix.size)
+        mix = contribution if mix is None else _pad_to(mix, contribution.shape[0]) + _pad_to(contribution, mix.shape[0])
 
     assert mix is not None
     mix = np.tanh(mix * 0.9)  # soft clip instead of hard clipping
     mix = _normalise(mix, peak=0.92)
-    write_wav(song, mix)
+    write_audio(song, mix, SAMPLE_RATE)
     return {
         "schema_version": 1,
         "mode": "render-song",
         "path": str(song),
         "bpm": bpm,
         "bars": bars,
-        "duration_ms": _duration_ms(mix.size, SAMPLE_RATE),
+        "duration_ms": _duration_ms(mix.shape[0], SAMPLE_RATE),
+        "channels": 2,
         "sample_rate": SAMPLE_RATE,
         "parts": rendered,
         "notes": [note_name(int(note.get("midi", 60))) for part in parts for note in (part.get("notes") or [])][:64],
@@ -385,9 +486,10 @@ def render_song(spec: dict) -> dict:
 
 
 def _pad_to(signal: np.ndarray, size: int) -> np.ndarray:
-    if signal.size >= size:
+    if signal.shape[0] >= size:
         return signal
-    return np.pad(signal, (0, size - signal.size))
+    padding = [(0, size - signal.shape[0])] + ([(0, 0)] if signal.ndim == 2 else [])
+    return np.pad(signal, padding)
 
 
 def mix_arrangement(spec: dict) -> dict:
@@ -422,7 +524,8 @@ def mix_arrangement(spec: dict) -> dict:
         "sample_rate": sample_rate,
         "bit_depth": bit_depth,
         "container": container,
-        "duration_ms": _duration_ms(mix.size, sample_rate),
+        "duration_ms": _duration_ms(mix.shape[0], sample_rate),
+        "channels": mix.shape[1],
         "clip_count": len(used),
         "tracks": used,
         "warnings": [],
@@ -436,7 +539,7 @@ def _mix_tracks(
     total: int,
 ) -> "tuple[np.ndarray, list[dict]]":
     """Sum the clips of `tracks` onto one buffer, honouring position, length and gains."""
-    mix = np.zeros(max(1, total), dtype=np.float32)
+    mix = np.zeros((max(1, total), 2), dtype=np.float32)
     used: "list[dict]" = []
     for track in tracks:
         track_gain = float(track.get("gain", 1.0))
@@ -447,23 +550,25 @@ def _mix_tracks(
             if not path:
                 continue
             try:
-                samples, rate = read_wav(path)
+                samples, rate = read_audio(path)
             except Exception:
                 continue
+            if samples.ndim == 1:
+                samples = np.stack([samples, samples], axis=1)
             samples = _resample(samples, rate, sample_rate)
             start = int(round(float(clip.get("start", 0)) * seconds_per_bar * sample_rate))
-            if start >= mix.size:
+            if start >= mix.shape[0]:
                 continue
-            length = samples.size
+            length = samples.shape[0]
             if clip.get("bars") is not None:
                 # honour the clip's length on the grid: trim, or pad with silence
                 wanted = int(round(float(clip["bars"]) * seconds_per_bar * sample_rate))
                 length = wanted
-                if samples.size > wanted:
+                if samples.shape[0] > wanted:
                     samples = samples[:wanted]
-                elif samples.size < wanted:
+                elif samples.shape[0] < wanted:
                     samples = _pad_to(samples, wanted)
-            end = min(mix.size, start + length)
+            end = min(mix.shape[0], start + length)
             if end <= start:
                 continue
             mix[start:end] += samples[: end - start] * track_gain * float(clip.get("gain", 1.0))
@@ -507,7 +612,8 @@ def export_stems(spec: dict) -> dict:
             {
                 "name": name,
                 "path": str(target),
-                "duration_ms": _duration_ms(samples.size, sample_rate),
+                "duration_ms": _duration_ms(samples.shape[0], sample_rate),
+                "channels": 2,
                 "clip_count": len(used),
             }
         )
