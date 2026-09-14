@@ -5,11 +5,14 @@ import sys
 
 from .cli import job_payload
 from .jobs import GenerationRequest, JobStore
+from .synth import render_part, render_song
 
 TOOLS = {
     "submit_generation": "Queue a Shadow Music Generator job. Dry-run validates the request and never runs a model.",
     "run_job": "Run a queued job through the configured SHADOW_PIPELINE_FACTORY adapter.",
     "job_status": "Read one job: status, stages, outputs, model license and errors.",
+    "render_part": "Render one musical part (drums/bass/chords/lead/pad) to a WAV file with the local synth.",
+    "render_song": "Render a whole sketch — several parts plus a mix — to WAV files with the local synth.",
 }
 
 SERVER_NAME = "shadow-music-generator"
@@ -42,6 +45,59 @@ def _schema(name: str) -> dict:
             },
             "required": ["prompt"],
             "additionalProperties": False,
+        }
+    if name in ("render_part", "render_song"):
+        note = {
+            "type": "object",
+            "properties": {
+                "midi": {"type": "integer", "description": "MIDI note number (60 = C4)."},
+                "start": {"type": "number", "description": "Start in beats from the beginning."},
+                "length": {"type": "number", "description": "Length in beats."},
+                "gain": {"type": "number"},
+            },
+            "required": ["midi", "start", "length"],
+        }
+        part = {
+            "type": "object",
+            "properties": {
+                "part": {"type": "string", "description": "drums | bass | chords | lead | pad"},
+                "gain": {"type": "number", "default": 1.0},
+                "wave": {"type": "string", "enum": ["sine", "triangle", "square", "saw"]},
+                "cutoff": {"type": "number", "description": "0–1 lowpass, for saw parts."},
+                "attack": {"type": "number"},
+                "release": {"type": "number"},
+                "vibrato": {"type": "number"},
+                "notes": {"type": "array", "items": note, "description": "For pitched parts."},
+                "pattern": {
+                    "type": "object",
+                    "description": "For drums: 16-step rows such as {\"kick\": \"x...x...x...x...\"}.",
+                    "additionalProperties": {"type": "string"},
+                },
+                "steps": {"type": "integer", "default": 16},
+                "out_path": {"type": "string"},
+            },
+            "required": ["part"],
+        }
+        if name == "render_part":
+            return {
+                "type": "object",
+                "properties": {
+                    "out_path": {"type": "string", "description": "WAV file to write."},
+                    "bpm": {"type": "number", "default": 120},
+                    "bars": {"type": "number", "default": 4},
+                    **part["properties"],
+                },
+                "required": ["out_path", "part"],
+            }
+        return {
+            "type": "object",
+            "properties": {
+                "out_path": {"type": "string", "description": "Mixed WAV to write; stems land beside it."},
+                "bpm": {"type": "number", "default": 120},
+                "bars": {"type": "number", "default": 4},
+                "parts": {"type": "array", "items": part, "minItems": 1},
+            },
+            "required": ["out_path", "parts"],
         }
     if name == "run_job":
         return {
@@ -128,6 +184,10 @@ def _run(name: str, arguments: dict) -> dict:
         return job_payload(store.run(str(arguments["job_id"]), arguments.get("factory")))
     if name == "job_status":
         return job_payload(store.get(str(arguments["job_id"])))
+    if name == "render_part":
+        return render_part(arguments)
+    if name == "render_song":
+        return render_song(arguments)
     raise ValueError(f"Unknown tool: {name}")
 
 
