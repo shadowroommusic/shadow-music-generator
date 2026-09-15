@@ -5,6 +5,7 @@ import sys
 
 from .cli import job_payload
 from .jobs import GenerationRequest, JobStore
+from .notes import SCALES, transform_notes
 from .synth import (
     container_capabilities,
     export_midi,
@@ -23,6 +24,7 @@ TOOLS = {
     "mix_arrangement": "Bounce an arrangement of clips to one file, at a chosen sample rate and container (WAV/AIFF).",
     "export_stems": "Bounce every track of an arrangement to its own file (stems).",
     "export_midi": "Write an arrangement of notated clips to a Type-1 MIDI file, one track per part.",
+    "transform_notes": "Deterministically edit a note list (transpose / quantise / scale / humanise / shift / velocity) — the arithmetic an agent should not do in its head.",
     "list_export_formats": "Which containers this machine can write (wav/aiff always; flac/alac/aac and mp3/ogg/opus need an encoder).",
 }
 
@@ -82,6 +84,57 @@ EMPTY_RESULTS = {
 
 
 def _schema(name: str) -> dict:
+    if name == "transform_notes":
+        return {
+            "type": "object",
+            "properties": {
+                "clip_id": {"type": "string", "description": "The clip these notes belong to; echoed back."},
+                "revision": {"type": "string", "description": "The revision the caller sent; echoed back so a stale edit can be refused."},
+                "seed": {"type": "integer", "default": 7, "description": "Makes humanise reproducible."},
+                "notes": {
+                    "type": "array",
+                    "description": "The notes exactly as the piano roll holds them.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "pitch": {"type": "integer"},
+                            "start_ms": {"type": "number"},
+                            "end_ms": {"type": "number"},
+                            "velocity": {"type": "integer"},
+                        },
+                        "required": ["pitch", "start_ms", "end_ms"],
+                    },
+                },
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {
+                                "type": "string",
+                                "enum": ["transpose", "quantise", "set_scale", "humanise", "shift", "velocity"],
+                            },
+                            "semitones": {"type": "integer", "description": "transpose"},
+                            "grid_ms": {"type": "number", "description": "quantise grid, e.g. 125 = a 16th at 120 BPM"},
+                            "strength": {"type": "number", "description": "quantise: 1 = exactly on the grid"},
+                            "root": {"type": "string", "description": "set_scale root, e.g. A"},
+                            "scale": {"type": "string", "enum": sorted(SCALES)},
+                            "timing_ms": {"type": "number", "description": "humanise timing spread"},
+                            "velocity": {"type": "number", "description": "humanise velocity spread"},
+                            "ms": {"type": "number", "description": "shift"},
+                            "add": {"type": "number", "description": "velocity: added to each note"},
+                            "scale_velocity": {"type": "number"},
+                            "note_ids": {"type": "array", "items": {"type": "string"}, "description": "Limit the operation to these notes"},
+                        },
+                        "required": ["op"],
+                    },
+                },
+            },
+            "required": ["notes", "operations"],
+            "additionalProperties": False,
+        }
     if name == "list_export_formats":
         return {"type": "object", "properties": {}, "additionalProperties": False}
     if name == "submit_generation":
@@ -364,6 +417,8 @@ def _run(name: str, arguments: dict) -> dict:
         return export_stems(arguments)
     if name == "list_export_formats":
         return {"containers": container_capabilities()}
+    if name == "transform_notes":
+        return transform_notes(arguments)
     if name == "export_midi":
         return export_midi(arguments)
     raise ValueError(f"Unknown tool: {name}")
