@@ -6,6 +6,7 @@ import sys
 from .cli import job_payload
 from .jobs import GenerationRequest, JobStore
 from .notes import SCALES, transform_notes
+from .structure import OPERATIONS, arrange
 from .synth import (
     container_capabilities,
     export_midi,
@@ -25,6 +26,7 @@ TOOLS = {
     "mix_arrangement": "Bounce an arrangement of clips to one file, at a chosen sample rate and container (WAV/AIFF).",
     "export_stems": "Bounce every track of an arrangement to its own file (stems).",
     "export_midi": "Write an arrangement of notated clips to a Type-1 MIDI file, one track per part.",
+    "arrange": "Edit the arrangement: insert empty bars, repeat a section, delete one — every clip's new position comes back as data.",
     "regenerate_part": "Re-render ONE part of a song from the plan it was made with, plus a small patch (gain/swing/cutoff/wave/pattern…).",
     "transform_notes": "Deterministically edit a note list (transpose / quantise / scale / humanise / shift / velocity) — the arithmetic an agent should not do in its head.",
     "list_export_formats": "Which containers this machine can write (wav/aiff always; flac/alac/aac and mp3/ogg/opus need an encoder).",
@@ -86,6 +88,66 @@ EMPTY_RESULTS = {
 
 
 def _schema(name: str) -> dict:
+    if name == "arrange":
+        return {
+            "type": "object",
+            "properties": {
+                "revision": {"type": "string", "description": "The arrangement revision these positions came from; echoed back."},
+                "bars": {"type": "number", "description": "Current length in bars."},
+                "sections": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "id": {"type": "string"},
+                            "name": {"type": "string"},
+                            "start": {"type": "number"},
+                            "bars": {"type": "number"},
+                        },
+                        "required": ["name", "start", "bars"],
+                    },
+                },
+                "tracks": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"},
+                            "clips": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "id": {"type": "string"},
+                                        "start": {"type": "number"},
+                                        "length": {"type": "number"},
+                                    },
+                                    "required": ["id", "start", "length"],
+                                },
+                            },
+                        },
+                        "required": ["name", "clips"],
+                    },
+                },
+                "operations": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "op": {"type": "string", "enum": list(OPERATIONS)},
+                            "at_bar": {"type": "number", "description": "insert_bars: 0-based bar"},
+                            "count": {"type": "number", "description": "insert_bars: how many bars"},
+                            "name": {"type": "string", "description": "insert_bars: what to call the new section"},
+                            "section": {"type": "string", "description": "duplicate/remove: section name or id"},
+                        },
+                        "required": ["op"],
+                    },
+                },
+            },
+            "required": ["bars", "sections", "tracks", "operations"],
+            "additionalProperties": False,
+        }
     if name == "regenerate_part":
         return {
             "type": "object",
@@ -118,7 +180,7 @@ def _schema(name: str) -> dict:
                     "additionalProperties": False,
                 },
             },
-            "required": ["out_path", "part", "patch"],
+            "required": ["out_path", "clip_id", "part", "patch"],
             "additionalProperties": False,
         }
     if name == "transform_notes":
@@ -458,6 +520,8 @@ def _run(name: str, arguments: dict) -> dict:
         return transform_notes(arguments)
     if name == "regenerate_part":
         return regenerate_part(arguments)
+    if name == "arrange":
+        return arrange(arguments)
     if name == "export_midi":
         return export_midi(arguments)
     raise ValueError(f"Unknown tool: {name}")
