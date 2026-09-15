@@ -343,6 +343,7 @@ class InterfaceTests(PipelineTestCase):
                 "mix_arrangement",
                 "export_stems",
                 "export_midi",
+                "regenerate_part",
                 "transform_notes",
                 "list_export_formats",
             ],

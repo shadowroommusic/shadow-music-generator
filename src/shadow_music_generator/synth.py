@@ -20,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .patches import apply_part_patch
+
 __all__ = [
     "export_midi",
     "export_stems",
@@ -821,6 +823,57 @@ def _duration_ms(samples: int, rate: int) -> int:
     return int(round(samples / rate * 1000))
 
 
+def regenerate_part(spec: dict) -> dict:
+    """Re-render one part from the plan it was made with, plus a patch.
+
+    `spec` is `{bpm, bars, sections?, part: {...}, seed?}` — exactly what `render_song` reported for
+    that part. The patch goes through `patches.apply_part_patch`, so only known knobs move and every
+    change comes back as a sentence the caller can show the user.
+    """
+    plan = spec.get("part")
+    if not isinstance(plan, dict):
+        raise ValueError("regenerate_part needs the part's spec")
+    patch = spec.get("patch") or {}
+    patched, described = apply_part_patch(plan, dict(patch))
+    bpm = float(spec.get("bpm", 120))
+    bars = float(spec.get("bars", 4))
+    sections = spec.get("sections") or []
+    out_path = spec.get("out_path")
+    if not out_path:
+        raise ValueError("regenerate_part needs an out_path")
+    payload = {
+        **patched,
+        "bpm": bpm,
+        "bars": bars,
+        "sections": sections,
+        "seed": int(spec.get("seed", patched.get("seed", 7))),
+    }
+    # A stem is normalised (that is how `render_song` writes them, and how the mixer weighs them), so
+    # turning the *gain* knob up inside the part would be normalised away again — measured: +5 dB came
+    # out 1.048× louder, i.e. inaudible. Regeneration therefore applies the gain *delta* on top of the
+    # normalised render, softly clipped, so "heavier" is something the user can actually hear.
+    base_gain = float(plan.get("gain", 1.0)) or 1.0
+    delta = float(patched.get("gain", 1.0)) / base_gain
+    samples = _normalise(renders_part(payload), peak=0.85)
+    if abs(delta - 1.0) > 1e-6:
+        samples = np.tanh(samples * delta * 0.95)
+    target = write_audio(out_path, samples, SAMPLE_RATE)
+    return {
+        "schema_version": 1,
+        "mode": "regenerate-part",
+        "clip_id": spec.get("clip_id"),
+        "part": str(patched.get("part", "part")),
+        "path": str(target),
+        "duration_ms": _duration_ms(samples.shape[0], SAMPLE_RATE),
+        "bpm": bpm,
+        "bars": bars,
+        "gain_delta": round(delta, 4),
+        "spec": {key: value for key, value in patched.items() if key != "out_path"},
+        "applied": described,
+        "diff_summary": "；".join(described),
+    }
+
+
 def render_part(spec: dict) -> dict:
     """Render one part to a WAV file and describe what was written."""
     out_path = spec.get("out_path")
@@ -888,6 +941,9 @@ def render_song(spec: dict) -> dict:
                 "gain": float(part.get("gain", 1.0)),
                 "pan": float(part.get("pan", 0.0)),
                 "segments": segments,
+                # The plan for this part, so the workbench can keep it on the clip and re-render
+                # exactly this part later (see `regenerate_part`).
+                "spec": {key: value for key, value in part.items() if key != "out_path"},
             }
         )
         contribution = samples * float(part.get("gain", 1.0))

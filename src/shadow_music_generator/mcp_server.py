@@ -11,6 +11,7 @@ from .synth import (
     export_midi,
     export_stems,
     mix_arrangement,
+    regenerate_part,
     render_part,
     render_song,
 )
@@ -24,6 +25,7 @@ TOOLS = {
     "mix_arrangement": "Bounce an arrangement of clips to one file, at a chosen sample rate and container (WAV/AIFF).",
     "export_stems": "Bounce every track of an arrangement to its own file (stems).",
     "export_midi": "Write an arrangement of notated clips to a Type-1 MIDI file, one track per part.",
+    "regenerate_part": "Re-render ONE part of a song from the plan it was made with, plus a small patch (gain/swing/cutoff/wave/pattern…).",
     "transform_notes": "Deterministically edit a note list (transpose / quantise / scale / humanise / shift / velocity) — the arithmetic an agent should not do in its head.",
     "list_export_formats": "Which containers this machine can write (wav/aiff always; flac/alac/aac and mp3/ogg/opus need an encoder).",
 }
@@ -84,6 +86,41 @@ EMPTY_RESULTS = {
 
 
 def _schema(name: str) -> dict:
+    if name == "regenerate_part":
+        return {
+            "type": "object",
+            "properties": {
+                "out_path": {"type": "string", "description": "Where the new stem goes."},
+                "clip_id": {"type": "string", "description": "The clip this part belongs to; echoed back so the UI can replace it."},
+                "bpm": {"type": "number", "default": 120},
+                "bars": {"type": "number", "default": 4},
+                "sections": {"type": "array", "items": {"type": "object"}},
+                "seed": {"type": "integer"},
+                "part": {"type": "object", "description": "The part exactly as render_song reported it under `spec`."},
+                "patch": {
+                    "type": "object",
+                    "description": "The change to make; only these keys are accepted.",
+                    "properties": {
+                        "gain_db": {"type": "number", "description": "-24…+6 dB"},
+                        "cutoff": {"type": "number", "description": "0–1 lowpass ratio, + is brighter"},
+                        "swing": {"type": "number", "description": "added swing, 0–0.4"},
+                        "humanize_ms": {"type": "number", "description": "added timing spread, 0–40 ms"},
+                        "pan": {"type": "number", "description": "-1 left … +1 right"},
+                        "reverb": {"type": "number", "description": "added wet amount"},
+                        "delay": {"type": "number", "description": "added delay mix"},
+                        "delay_ms": {"type": "number"},
+                        "wave": {"type": "string", "enum": ["sine", "triangle", "square", "saw"]},
+                        "pattern": {"type": "object", "additionalProperties": {"type": "string"}},
+                        "remove_voices": {"type": "array", "items": {"type": "string"}},
+                        "transpose": {"type": "integer"},
+                        "velocity_scale": {"type": "number"},
+                    },
+                    "additionalProperties": False,
+                },
+            },
+            "required": ["out_path", "part", "patch"],
+            "additionalProperties": False,
+        }
     if name == "transform_notes":
         return {
             "type": "object",
@@ -419,6 +456,8 @@ def _run(name: str, arguments: dict) -> dict:
         return {"containers": container_capabilities()}
     if name == "transform_notes":
         return transform_notes(arguments)
+    if name == "regenerate_part":
+        return regenerate_part(arguments)
     if name == "export_midi":
         return export_midi(arguments)
     raise ValueError(f"Unknown tool: {name}")
